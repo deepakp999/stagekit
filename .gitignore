@@ -1,9 +1,10 @@
 # Secrets and local settings
 .env
-data/cookies.txt
+/data/cookies.txt
 
-# App data: songs, stems, models, database (can be several GB)
-data/
+# App data: songs, stems, models, database (can be several GB).
+# Leading slash = only the top-level data folder; app/data (MODX preset lists) must be committed.
+/data/
 
 # Python
 .venv/
