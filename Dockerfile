@@ -12,8 +12,12 @@ RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- -
 
 WORKDIR /srv
 COPY requirements.txt .
-RUN pip install --extra-index-url https://download.pytorch.org/whl/cpu torch \
-    && pip install -r requirements.txt
+# torch and torchvision must come from the same build, or torchvision fails with
+# "operator torchvision::nms does not exist". Pin both while installing the rest.
+RUN pip install --extra-index-url https://download.pytorch.org/whl/cpu torch torchvision \
+    && pip freeze | grep -E '^(torch|torchvision)==' > /tmp/torch-pins.txt \
+    && pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt -c /tmp/torch-pins.txt \
+    && python -c "import torch, torchvision; print('torch', torch.__version__, 'torchvision', torchvision.__version__)"
 
 COPY app ./app
 COPY web ./web
