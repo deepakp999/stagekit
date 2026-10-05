@@ -158,3 +158,9 @@ table.plan select{width:64px;padding:5px}
 @media(max-width:600px){.top nav a{padding:6px 8px}}
 .top nav a,.logout{white-space:nowrap}
 @media(max-width:600px){.top{gap:8px;padding:8px 10px}.bname{display:none}.top nav{gap:2px}.top nav a{padding:6px 7px;font-size:14px}}
+dialog.finder{overflow:auto}
+.acols{grid-template-columns:300px 1fr}
+@media(max-width:860px){.acols{grid-template-columns:1fr}}
+dialog.finder .chk input[type=number]{display:inline-block;width:64px;padding:4px 6px}
+.acols>*,.fcols>*{min-width:0}
+.frow .grow{min-width:0;overflow-wrap:anywhere}

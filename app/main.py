@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import auth as auth_mod
-from . import db, modx, worker
+from . import autobuild, db, modx, worker
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "web")
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
@@ -154,6 +154,8 @@ def patch_song(sid: str, body: SongPatch):
     if body.card is not None:
         card = {**db.DEFAULT_CARD, **s["card"], **body.card}
         card["detected"] = s["card"].get("detected", {})  # detection results are read-only
+        if "auto_cache" in s["card"]:
+            card["auto_cache"] = s["card"]["auto_cache"]
         fields["card"] = card
     if fields:
         db.update_song(sid, **fields)
@@ -183,6 +185,41 @@ def make_stems(sid: str):
         pass
     db.update_song(sid, status="queued", stage="Waiting", progress=0, error=None)
     return _public(db.get_song(sid))
+
+
+class AutoBody(BaseModel):
+    feel: str = ""
+    refresh: bool = False
+
+
+def _plain(x):
+    """numpy → plain JSON types."""
+    return json.loads(json.dumps(x, default=lambda o: o.item() if hasattr(o, "item") else str(o)))
+
+
+@app.post("/api/songs/{sid}/autobuild", dependencies=[Depends(auth)])
+def song_autobuild(sid: str, body: AutoBody):
+    """Listen to the song and suggest a style, sections→scenes and a full scene plan. Saves nothing."""
+    s = db.get_song(sid)
+    if not s:
+        raise HTTPException(404, "Song not found")
+    if s["status"] != "ready":
+        raise HTTPException(409, "Wait until the song has finished processing")
+    d = db.song_dir(sid)
+    card = s["card"]
+    cache = card.get("auto_cache")
+    meter = card.get("meter") or "4/4"
+    bpm = card.get("bpm") or (card.get("detected") or {}).get("bpm")
+    has_drums = os.path.exists(os.path.join(d, "stems", "drums.wav"))
+    if body.refresh or not cache or cache.get("meter") != meter or cache.get("drums") != has_drums:
+        r = _plain(autobuild.recommend(d, card, body.feel))
+        cache = {"meter": meter, "drums": has_drums, "groove": r["groove"], "sections": r["sections"]}
+        db.update_song(sid, card={**card, "auto_cache": cache})
+        return r
+    styles = _plain(autobuild.match_styles(meter, bpm, cache["groove"], body.feel))
+    return {"meter": meter, "bpm": bpm, "groove": cache["groove"], "feel": body.feel, "styles": styles,
+            "sections": cache["sections"], "plan": _plain(modx.scene_plan(styles[0]["family"])) if styles else None,
+            "used_drum_stem": has_drums}
 
 
 @app.get("/api/songs/{sid}/chords", dependencies=[Depends(auth)])

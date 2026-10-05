@@ -306,14 +306,29 @@ const MIDI = {
 const ymh = (addr, data) => [0xF0, 0x43, 0x10, 0x7F, 0x1C, 0x0D, ...addr, ...data, 0xF7];
 const d14 = v => [(v >> 7) & 127, v & 127];
 // Writes a scene plan into the Performance currently open on the MODX (edit buffer). Nothing is saved until STORE.
-function scenePlanMessages(plan, tempo) {
-  const msgs = [];
+// opts.split: MIDI note where the right hand starts (arp Parts only receive notes below it); null = no split.
+// opts.lead: {part, sound_no} right-hand Part above the split. opts.othersOff: switch every other Part off.
+function scenePlanMessages(plan, tempo, opts = {}) {
+  const msgs = [], used = new Set();
+  const part1 = (p, off, v) => msgs.push(ymh([0x10 + p, 0x00, 0x01, off], [v]));
+  const limits = (p, lo, hi) => { msgs.push(ymh([0x10 + p, 0x00, 0x02, 0x08], [0, lo & 127])); msgs.push(ymh([0x10 + p, 0x00, 0x02, 0x0A], [0, hi & 127])); };
   for (const row of plan.parts) {
     if (!row.part) continue;
-    const p = row.part - 1;
-    msgs.push(ymh([0x10 + p, 0x00, 0x01, 0x47], [1]));                       // Part Arp Switch on
+    const p = row.part - 1; used.add(p);
+    part1(p, 0x00, 1);                                     // Part Switch on
+    part1(p, 0x02, 1);                                     // Keyboard Control on (the keys trigger this Part's arps)
+    part1(p, 0x47, 1);                                     // Part Arp Switch on
+    if (opts.arpOnly !== false) part1(p, 0x48, 1);         // Arp Play Only: only the pattern sounds, not the held keys
     row.scenes.forEach((no, i) => { if (no) msgs.push(ymh([0x10 + p, 0x00, 0x06, 0x44 + 2 * i], d14(no))); }); // Arp 1–8 Number
+    if (opts.split != null) limits(p, 0, opts.split - 1);
+    else if (opts.resetLimits) limits(p, 0, 127);
   }
+  if (opts.lead && opts.lead.part) {
+    const p = opts.lead.part - 1; used.add(p);
+    part1(p, 0x00, 1); part1(p, 0x02, 1); part1(p, 0x47, 0); part1(p, 0x48, 0);
+    limits(p, opts.split != null ? opts.split : 0, 127);
+  }
+  if (opts.othersOff) for (let p = 0; p < 16; p++) if (!used.has(p)) part1(p, 0x00, 0);
   for (let c = 0; c < 8; c++) {
     msgs.push(ymh([0x06, 0x02, c, 0x00], [1]));      // Scene Arpeggio Master Switch on
     msgs.push(ymh([0x06, 0x02, c, 0x02], [1]));      // Scene Arpeggio Memorize Switch on
@@ -321,7 +336,138 @@ function scenePlanMessages(plan, tempo) {
   }
   msgs.push(ymh([0x06, 0x00, 0x01, 0x09], [1]));     // Arpeggio Master Switch on
   if (tempo) msgs.push(ymh([0x06, 0x00, 0x02, 0x1E], d14(Math.round(Math.min(300, Math.max(5, tempo)))))); // Tempo
+  msgs.push(ymh([0x06, 0x00, 0x02, 0x2A], [0, 0])); // Select Scene 1 so you start at the intro
   return msgs;
+}
+
+// Loads sounds (optional) then writes the plan into the Performance open on the MODX. Returns true on success.
+async function sendPlanToModx(plan, bpm, opts = {}) {
+  const out = await MIDI.ensure(); if (!out) return false;
+  if (!/modx|yamaha|montage/i.test(out.name) && !confirm(`The MIDI output is "${out.name}", not a MODX. Send anyway?`)) return false;
+  if (!confirm("This changes the Performance currently open on your MODX (sounds, arps, scenes" + (opts.othersOff ? ", other Parts off" : "") +
+    "). Nothing is saved until you press STORE; reloading the Performance undoes it. Continue?")) return false;
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  try {
+    if (opts.withSounds !== false) {
+      // Single Part bank select (MSB 63) on each Part's channel replaces just that Part's sound (MIDI I/O Mode: Multi).
+      for (const r of plan.parts) if (r.part && r.sound_no) presetMsgs(r.sound_no, r.part - 1, 63).forEach(m => out.send(m));
+      if (opts.lead && opts.lead.part && opts.lead.sound_no) presetMsgs(opts.lead.sound_no, opts.lead.part - 1, 63).forEach(m => out.send(m));
+      await wait(1200); // let the MODX finish loading sounds before setting Part parameters
+    }
+    for (const m of scenePlanMessages(plan, bpm, opts)) { out.send(m); await wait(12); }
+    toast("Sent. Hold a chord" + (opts.split != null ? " with your left hand" : "") + " and try scenes 1–8; press STORE on the MODX to keep it.", 7000);
+    return true;
+  } catch (e) { toast("Sending failed: " + e.message + " — allow full MIDI (SysEx) access in Chrome.", 7000); return false; }
+}
+
+const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const noteName = n => `${NOTE_NAMES[n % 12]}${Math.floor(n / 12) - 2}`;   // Yamaha: C3 = 60
+const SPLIT_CHOICES = [null, 48, 53, 54, 55, 60];
+
+// ---------------- Auto-build ----------------
+
+const AUTO_FEELS = [["", "Auto"], ["pop", "Pop / rock"], ["ballad", "Ballad"], ["devotional", "Devotional"], ["cinematic", "Cinematic"], ["dance", "Dance"], ["indian", "Indian"]];
+
+async function openAutoBuild({sid, meter, bpm, onApply}) {
+  const prefs = (() => { try { return JSON.parse(localStorage.getItem("sk_auto") || "{}"); } catch { return {}; } })();
+  const st = {feel: prefs.feel || "", split: prefs.split === undefined ? 54 : prefs.split, lead: prefs.lead || {no: 3, name: "CFX Concert"},
+    tabla: prefs.tabla || {use: false, first: 1, kit: 2813}, othersOff: prefs.othersOff !== false, useSections: true};
+  const savePrefs = () => { try { localStorage.setItem("sk_auto", JSON.stringify({feel: st.feel, split: st.split, lead: st.lead, tabla: st.tabla, othersOff: st.othersOff})); } catch {} };
+  const dlg = document.createElement("dialog"); dlg.className = "mdlg finder";
+  dlg.innerHTML = `<div class="row"><h2 class="grow" style="margin:0">✨ Auto-build</h2><button class="btn sm" id="ax" aria-label="Close">✕</button></div>
+    <div id="abody"><div class="empty">Listening to the song… the first time takes up to a minute.</div></div>`;
+  document.body.appendChild(dlg);
+  $("#ax", dlg).onclick = () => dlg.close();
+  dlg.addEventListener("close", () => dlg.remove());
+  dlg.showModal();
+  let r = null, chosen = null, plan = null;
+
+  const load = async refresh => {
+    try { r = await api(`songs/${sid}/autobuild`, {method: "POST", json: {feel: st.feel, refresh: !!refresh}}); }
+    catch (e) { $("#abody", dlg).innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+    chosen = r.styles[0]?.family || null;
+    plan = r.plan ? toPlan(r.plan) : null;
+    draw();
+  };
+  const toPlan = p => ({family: p.family, ts: p.ts, tempo: p.tempo, parts: p.parts.map((x, i) => ({
+    cat: x.cat, label: x.label, sound: x.sound, sound_no: x.sound_no, sound_name: x.sound_name,
+    names: x.scenes.map(y => y && y.name), scenes: x.scenes.map(y => y && y.no), part: i < 4 ? i + 1 : 0}))});
+  const applyTabla = p => {
+    if (!st.tabla.use || !p) return p;
+    const drums = p.parts.find(x => x.cat === "Dr/Pc");
+    if (!drums) return p;
+    const first = 12032 + Math.max(0, Math.min(255, (st.tabla.first || 1) - 1));   // User arpeggio numbers start at 12032
+    return {...p, parts: p.parts.map(x => x !== drums ? x : {...x, label: "Tabla (your arps)", sound: null,
+      sound_no: st.tabla.kit || 2813, sound_name: st.tabla.kit === 2813 ? "Hands Kit" : `Preset #${st.tabla.kit}`,
+      scenes: x.scenes.map((_, i) => first + i), names: x.scenes.map((_, i) => `User ${st.tabla.first + i}`)})};
+  };
+
+  function draw() {
+    const g = r.groove;
+    const finalPlan = applyTabla(plan);
+    const leadPart = finalPlan ? Math.min(8, finalPlan.parts.filter(x => x.part).length + 1) : 5;
+    dlg._final = {plan: finalPlan, leadPart};
+    $("#abody", dlg).innerHTML = `
+      <div class="small muted" style="margin:6px 0 10px">${esc(r.meter)} · ${r.bpm ? esc(r.bpm) + " BPM · " : ""}${g ? `${esc(g.feel)} ${esc(g.subdivision)}s · ${esc(g.busy)} drums` : "groove not detected"}
+        ${r.used_drum_stem ? "" : " · <span title='Make stems for a better groove reading'>no drum stem (chords-only song)</span>"}
+        · <a href="#" id="arefresh">re-analyse</a></div>
+      <div class="chipsel" id="afeel">${AUTO_FEELS.map(([k, v]) => `<button class="chipb ${k === st.feel ? "on" : ""}" data-f="${k}">${v}</button>`).join("")}</div>
+      <div class="fcols acols" style="margin-top:12px">
+        <div>
+          <h3>Groove style</h3>
+          <div class="flist" id="astyles" style="max-height:38vh">${r.styles.map((x, i) => `<label class="frow sbtn ${x.family === chosen ? "on" : ""}"><input type="radio" name="ast" value="${esc(x.family)}" ${x.family === chosen ? "checked" : ""}>
+            <span class="grow"><b>${esc(x.family)}</b>${i === 0 ? ' <span class="chip ready">best match</span>' : ""}<br>
+            <span class="small muted">${esc(x.ts)} · ${x.tempo} BPM · ${esc(x.instruments.join(", "))}</span><br>
+            <span class="small">${esc(x.why.join(" · ") || "—")}</span></span></label>`).join("") || '<div class="muted small">No styles in this meter.</div>'}</div>
+          <h3 style="margin-top:12px">Playing setup</h3>
+          <label class="f">Split point (left hand plays the band)</label>
+          <select id="asplit">${SPLIT_CHOICES.map(n => `<option value="${n ?? ""}" ${n === st.split ? "selected" : ""}>${n == null ? "No split — whole keyboard" : `${noteName(n)} — left hand below`}</option>`).join("")}</select>
+          <label class="f" style="margin-top:8px">Right-hand sound (Part ${leadPart})</label>
+          <div class="row"><span class="grow" id="alead">${st.split == null ? '<span class="muted">— no split</span>' : `${esc(st.lead.name)} <span class="muted">#${st.lead.no}</span>`}</span>
+            <button class="btn sm" id="aleadpick" ${st.split == null ? "disabled" : ""}>Change</button></div>
+          ${st.feel === "indian" ? `<label class="chk"><input type="checkbox" id="atabla" ${st.tabla.use ? "checked" : ""}> Use my tabla arps for drums: User arp
+            <input id="atfirst" type="number" min="1" max="249" value="${st.tabla.first}" style="width:60px"> onwards</label>
+            <div class="small muted">Make them in the Tabla tab (S1–S8 → 8 consecutive user arps).</div>` : ""}
+          <label class="chk"><input type="checkbox" id="aoff" ${st.othersOff ? "checked" : ""}> Switch off all other Parts</label>
+        </div>
+        <div>
+          <h3>Plan</h3>
+          ${finalPlan ? `<div class="ptable"><table class="sec plan"><thead><tr><th>Part</th><th>Instrument</th><th>Sound</th>${["Intro", "Main A", "Main B", "Main C", "Fill A", "Fill B", "Break", "Ending"].map((n, i) => `<th>S${i + 1}<br><span class="muted">${n}</span></th>`).join("")}</tr></thead><tbody>
+            ${finalPlan.parts.filter(x => x.part).map(x => `<tr><td>${x.part}</td><td><b>${esc(x.label)}</b></td><td class="small">${esc(x.sound_name || "–")}</td>${x.scenes.map(n => `<td class="an">${n || "–"}</td>`).join("")}</tr>`).join("")}
+            ${st.split != null ? `<tr><td>${leadPart}</td><td><b>Right hand</b></td><td class="small">${esc(st.lead.name)}</td><td colspan="8" class="small muted">plays from ${noteName(st.split)} up, no arp</td></tr>` : ""}
+          </tbody></table></div>` : '<div class="muted small">No plan.</div>'}
+          <h3 style="margin-top:14px">Sections → scenes</h3>
+          ${r.sections.length ? `<table class="sec"><thead><tr><th>Section</th><th>Starts</th><th>Scene</th><th>Chords</th></tr></thead><tbody>
+            ${r.sections.map(x => `<tr><td><b>${esc(x.name)}</b>${x.cue ? `<br><span class="small muted">${esc(x.cue)}</span>` : ""}</td><td>${fmtTime(x.start)}</td><td>S${x.scene}</td><td class="small">${esc(x.chords || "")}</td></tr>`).join("")}
+          </tbody></table>
+          <label class="chk"><input type="checkbox" id="asecs" ${st.useSections ? "checked" : ""}> Replace the song's sections with these</label>` : '<div class="muted small">Song too short to find sections.</div>'}
+          <div class="row" style="margin-top:14px"><span class="grow"></span>
+            <button class="btn" id="aapply">Apply to song</button>
+            <button class="btn primary" id="asend">Apply &amp; send to MODX</button></div>
+        </div>
+      </div>`;
+    $("#arefresh", dlg).onclick = e => { e.preventDefault(); $("#abody", dlg).innerHTML = '<div class="empty">Re-analysing…</div>'; load(true); };
+    $$("#afeel .chipb", dlg).forEach(b => b.onclick = () => { st.feel = b.dataset.f; savePrefs(); $("#abody", dlg).innerHTML = '<div class="empty">Matching styles…</div>'; load(false); });
+    $$("input[name=ast]", dlg).forEach(i => i.onchange = async () => {
+      chosen = i.value; plan = toPlan(await api(`modx/scene-plan?family=${encodeURIComponent(chosen)}`)); draw();
+    });
+    $("#asplit", dlg).onchange = e => { st.split = e.target.value === "" ? null : +e.target.value; savePrefs(); draw(); };
+    $("#aleadpick", dlg).onclick = () => openFinder({meter, bpm, onUse: p => { st.lead = {no: p.no, name: p.name}; savePrefs(); draw(); }, onArp: () => {}});
+    $("#aoff", dlg).onchange = e => { st.othersOff = e.target.checked; savePrefs(); };
+    $("#atabla", dlg)?.addEventListener("change", e => { st.tabla.use = e.target.checked; savePrefs(); draw(); });
+    $("#atfirst", dlg)?.addEventListener("change", e => { st.tabla.first = Math.max(1, Math.min(249, +e.target.value || 1)); savePrefs(); draw(); });
+    $("#asecs", dlg)?.addEventListener("change", e => { st.useSections = e.target.checked; });
+    const result = () => ({plan: dlg._final.plan, sections: st.useSections ? r.sections : null,
+      opts: {split: st.split, lead: st.split != null ? {part: dlg._final.leadPart, sound_no: st.lead.no, name: st.lead.name} : null,
+        othersOff: st.othersOff, withSounds: true, resetLimits: st.split == null}});
+    $("#aapply", dlg).onclick = async () => { await onApply(result(), false); dlg.close(); };
+    $("#asend", dlg).onclick = async () => {
+      const res = result();
+      if (!res.plan) return toast("No plan to send");
+      if (await sendPlanToModx(res.plan, bpm || r.bpm, res.opts)) { await onApply(res, true); dlg.close(); }
+    };
+  }
+  await load(false);
 }
 
 async function openScenePlan({meter = "4/4", bpm = null, current = null, onSave}) {
@@ -371,21 +517,7 @@ async function openScenePlan({meter = "4/4", bpm = null, current = null, onSave}
     $$("#splan select", dlg).forEach(sel => sel.onchange = () => { plan.parts[+sel.dataset.k].part = +sel.value; });
     $("#psave", dlg).onclick = () => { onSave(plan); dlg.close(); };
     $("#psend", dlg).onclick = async () => {
-      const out = await MIDI.ensure(); if (!out) return;
-      if (!/modx|yamaha|montage/i.test(out.name) && !confirm(`The MIDI output is "${out.name}", not a MODX. Send anyway?`)) return;
-      const withSounds = $("#psnd", dlg).checked;
-      if (!confirm(`This changes the Performance currently open on your MODX${withSounds ? " (sounds on the chosen Parts," : " ("}arps and all 8 scenes). Nothing is saved until you press STORE; reloading the Performance undoes it. Continue?`)) return;
-      const wait = ms => new Promise(r => setTimeout(r, ms));
-      try {
-        if (withSounds) {
-          // Single Part bank select (MSB 63) on each Part's channel replaces just that Part's sound.
-          for (const r of plan.parts) if (r.part && r.sound_no) presetMsgs(r.sound_no, r.part - 1, 63).forEach(m => out.send(m));
-          await wait(900); // let the MODX finish loading sounds before setting arps
-        }
-        for (const m of scenePlanMessages(plan, bpm)) { out.send(m); await wait(15); }
-        onSave(plan); dlg.close();
-        toast("Sent. Try scenes 1–8 on the MODX; if it sounds right, press STORE.", 6000);
-      } catch (e) { toast("Sending failed: " + e.message + " — allow full MIDI (SysEx) access in Chrome.", 6000); }
+      if (await sendPlanToModx(plan, bpm, {withSounds: $("#psnd", dlg).checked})) { onSave(plan); dlg.close(); }
     };
   };
   let t = null;
@@ -506,7 +638,7 @@ async function songView(sid) {
             <div class="prf" style="grid-column:span 3;align-self:end"><button class="btn" id="finder" type="button">🔎 Find a sound for this song</button></div>
           </div>
           <div class="small muted" style="margin-top:4px" id="modehelp"></div>
-          <div class="row" style="margin-top:8px"><button class="btn" id="scenebtn" type="button">🎛 Build scenes (drums, bass, guitar…)</button>
+          <div class="row" style="margin-top:8px">${s.status === "ready" ? `<button class="btn primary" id="autobtn" type="button">✨ Auto-build</button>` : ""}<button class="btn" id="scenebtn" type="button">🎛 Build scenes by hand</button>
             <span class="small muted" id="planinfo">${c.scene_plan ? `Plan: ${esc(c.scene_plan.family)}` : ""}</span></div>
           <h2>Sections and scenes</h2>
           <table class="sec"><thead><tr><th>Section</th><th>Scene</th><th>Chords / cue</th><th></th></tr></thead><tbody id="secs"></tbody></table>
@@ -568,6 +700,15 @@ async function songView(sid) {
         : "Nothing is sent when the song opens. MODX transpose is shown on stage as a reminder.";
     };
     $("#mode").onchange = modeUi; modeUi();
+    $("#autobtn")?.addEventListener("click", async () => {
+      await save();
+      openAutoBuild({sid, meter: $("#meter").value, bpm: num("#bpm"), onApply: async (res, sent) => {
+        const card = {scene_plan: res.plan, auto_options: res.opts};
+        if (res.sections) card.sections = res.sections.map(x => ({name: x.name, scene: x.scene, chords: x.chords || "", cue: x.cue || "", start: x.start}));
+        s = await api(`songs/${sid}`, {method: "PATCH", json: {card}});
+        mixer?.destroy(); render(); toast(sent ? "Applied and sent — press STORE on the MODX to keep it" : "Applied to the song");
+      }});
+    });
     $("#scenebtn").onclick = () => openScenePlan({meter: $("#meter").value, bpm: num("#bpm"), current: scenePlan, onSave: plan => {
       scenePlan = plan; $("#planinfo").textContent = `Plan: ${plan.family}`; toast("Scene plan added — Save to keep it");
     }});
