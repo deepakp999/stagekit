@@ -1,0 +1,9 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+pydantic>=2.6
+yt-dlp[default]
+audio-separator[cpu]>=0.30
+librosa>=0.10
+audioread
+numpy

@@ -1,0 +1,17 @@
+services:
+  stagekit:
+    build: .
+    container_name: stagekit
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data          # songs, stems, models (~1.5 GB of models after first song)
+    ports:
+      - "127.0.0.1:8080:8080" # only reachable through Caddy
+    deploy:
+      resources:
+        limits:
+          memory: 12g         # separation peaks at a few GB; leave room for Paperclip
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}

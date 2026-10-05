@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>StageKit</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/"><img src="icon.svg" alt=""> <span class="bname">StageKit</span></a>
+  <nav>
+    <a href="#/" data-nav="library">Library</a>
+    <a href="#/sets" data-nav="sets">Set lists</a>
+    <a href="#/tabla" data-nav="tabla">Tabla</a>
+  </nav>
+  <a href="#" id="logout" class="logout">Sign out</a>
+</header>
+<main id="view"></main>
+<div id="toast" role="status" aria-live="polite"></div>
+<script src="tabla.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+# Secrets and local settings
+.env
+data/cookies.txt
+
+# App data: songs, stems, models, database (can be several GB)
+data/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Editors and OS files
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Logs and temporary files
+*.log
+*.tmp
