@@ -1,5 +1,5 @@
 // App shell cached for offline use on stage. Song data: network first, cached copy if offline.
-const SHELL = "stagekit-shell-v13";
+const SHELL = "stagekit-shell-v16";
 const DATA = "stagekit-data-v1";
 const FILES = ["./", "index.html", "styles.css", "app.js", "tabla.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "icon-512.png"];
 

@@ -193,6 +193,17 @@ def make_stems(sid: str):
 class AutoBody(BaseModel):
     feel: str = ""
     refresh: bool = False
+    band: str = ""   # "" = style as-is, "unplugged" or "band" = arranger-style full band on Parts 2–8
+
+
+def _plan_for(family, band, card=None):
+    """Band plans use the song's tone analysis and your saved sound choices for that mood."""
+    if band in modx.BAND_POOLS:
+        card = card or {}
+        tone = (card.get("auto_cache") or {}).get("tone")
+        overrides = (card.get("sound_overrides") or {}).get(band)
+        return modx.band_plan(family, band, tone=tone, overrides=overrides)
+    return modx.scene_plan(family)
 
 
 def _plain(x):
@@ -216,12 +227,22 @@ def song_autobuild(sid: str, body: AutoBody):
     has_drums = os.path.exists(os.path.join(d, "stems", "drums.wav"))
     if body.refresh or not cache or cache.get("meter") != meter or cache.get("drums") != has_drums:
         r = _plain(autobuild.recommend(d, card, body.feel))
-        cache = {"meter": meter, "drums": has_drums, "groove": r["groove"], "sections": r["sections"]}
-        db.update_song(sid, card={**card, "auto_cache": cache})
+        cache = {"meter": meter, "drums": has_drums, "groove": r["groove"], "sections": r["sections"], "tone": r.get("tone")}
+        card = {**card, "auto_cache": cache}
+        db.update_song(sid, card=card)
+        if body.band and r.get("styles"):
+            r["plan"] = _plain(_plan_for(r["styles"][0]["family"], body.band, card))
         return r
+    if "tone" not in cache:  # songs analysed before tone analysis existed
+        try:
+            cache = {**cache, "tone": _plain(autobuild.tone_features(d))}
+        except Exception:
+            cache = {**cache, "tone": None}
+        card = {**card, "auto_cache": cache}
+        db.update_song(sid, card=card)
     styles = _plain(autobuild.match_styles(meter, bpm, cache["groove"], body.feel))
     return {"meter": meter, "bpm": bpm, "groove": cache["groove"], "feel": body.feel, "styles": styles,
-            "sections": cache["sections"], "plan": _plain(modx.scene_plan(styles[0]["family"])) if styles else None,
+            "sections": cache["sections"], "plan": _plain(_plan_for(styles[0]["family"], body.band, card)) if styles else None, "tone": cache.get("tone"),
             "used_drum_stem": has_drums}
 
 
@@ -464,8 +485,9 @@ def modx_styles(q: str = "", meter: str = "", bpm: Optional[float] = None):
 
 
 @app.get("/api/modx/scene-plan", dependencies=[Depends(auth)])
-def modx_scene_plan(family: str):
-    plan = modx.scene_plan(family)
+def modx_scene_plan(family: str, band: str = "", sid: str = ""):
+    s = db.get_song(sid) if sid else None
+    plan = _plan_for(family, band, s["card"] if s else None)
     if not plan:
         raise HTTPException(404, "Style not found")
     return plan

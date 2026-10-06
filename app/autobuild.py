@@ -304,6 +304,38 @@ def match_styles(meter, bpm, groove, feel="", top=5):
 
 # ---------------------------------------------------------------- one call for the UI
 
+def tone_features(song_dir):
+    """What the original sounds like, for choosing sounds: brightness of the band, how busy the
+    guitar/keys part is (strummed vs picked/sparse), and how much of it is sustained (pads/strings).
+    Uses the 'other' stem (guitar, keys, strings, pads) when there is one, else the instrumental/mix."""
+    import librosa
+
+    stems = os.path.join(song_dir, "stems")
+    for name in ("other.wav", "instrumental.wav"):
+        path = os.path.join(stems, name)
+        if os.path.exists(path):
+            break
+    else:
+        path = os.path.join(song_dir, "original.wav")
+    try:
+        y, sr = librosa.load(path, sr=SR, mono=True, duration=180)
+    except Exception:
+        return None
+    if len(y) < sr * 5 or float(np.sqrt(np.mean(y ** 2))) < 1e-4:
+        return None
+    centroid = float(np.median(librosa.feature.spectral_centroid(y=y, sr=sr)))
+    harm, perc = librosa.effects.hpss(y)
+    he, pe = float(np.sum(harm ** 2)), float(np.sum(perc ** 2))
+    onsets = librosa.onset.onset_detect(y=y, sr=sr, units="time")
+    rate = len(onsets) / (len(y) / sr)
+    # Map to 0..1: ~1200 Hz centroid = dark, ~3200 Hz = bright for a band stem.
+    bright = float(np.clip((centroid - 1200) / 2000, 0, 1))
+    sustain = float(np.clip(he / (he + pe + 1e-9) * 1.25 - 0.25, 0, 1))
+    busy = float(np.clip((rate - 1.5) / 4.5, 0, 1))
+    return {"brightness": round(bright, 2), "sustain": round(sustain, 2), "busy": round(busy, 2),
+            "strummed": busy > 0.45, "source": os.path.basename(path)}
+
+
 def recommend(song_dir, card, feel=""):
     stems = os.path.join(song_dir, "stems")
     drums = os.path.join(stems, "drums.wav")
@@ -318,5 +350,9 @@ def recommend(song_dir, card, feel=""):
     sections = detect_sections(wav, chords, meter)
     styles = match_styles(meter, bpm, groove, feel)
     plan = modx.scene_plan(styles[0]["family"]) if styles else None
+    try:
+        tone = tone_features(song_dir)
+    except Exception:
+        tone = None
     return {"meter": meter, "bpm": bpm, "groove": groove, "feel": feel, "styles": styles,
-            "sections": sections, "plan": plan, "used_drum_stem": os.path.exists(drums)}
+            "sections": sections, "plan": plan, "used_drum_stem": os.path.exists(drums), "tone": tone}

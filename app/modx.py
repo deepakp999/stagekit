@@ -282,3 +282,164 @@ def scene_plan(family):  # noqa: F811 — extends the plan with a suggested soun
         p = resolve_sound(row["cat"], row.get("sound"))
         row["sound_no"], row["sound_name"] = (p["no"], p["name"]) if p else (None, None)
     return plan
+
+
+# ---------- arranger-style band (Parts 2–8) ----------
+# Part 1 stays your right-hand sound. The left hand drives the band: drums, percussion, bass, guitar and
+# keys play arpeggio patterns; strings and pad hold the chord you play. Missing instruments are borrowed
+# from other grooves with the same time signature (nearest tempo).
+PERC_RX = re.compile(r"percussion|latin|conga|bongo|shaker|cajon|tabla", re.I)
+ACOUSTIC_GTR_RX = re.compile(r"acoustic|steel|nylon|12str|finger", re.I)
+BAND_ROLES = [("drums", "Drums"), ("perc", "Percussion"), ("bass", "Bass"), ("gtr", "Guitar"),
+              ("keys", "Piano / keys"), ("strings", "Strings"), ("pad", "Pad")]
+# Sound pools per band mood and instrument (preset Performance numbers), ordered warm/dark -> bright.
+# A song picks from each pool by what it sounds like (brightness, strummed vs picked, sustained parts);
+# 0 = leave the instrument out; "lead" = suggested melody sounds for the right hand.
+BAND_POOLS = {
+    "unplugged": {"drums": [1226, 1225, 2753], "perc": [2807, 2830], "bass": [2537, 2491],
+                  "gtr": {"pick": [2529, 316, 314], "strum": [317, 323, 322]}, "keys": [26, 29, 31, 3],
+                  "strings": [493, 492, 494], "pad": [784, 2132, 2594], "lead": [3, 26, 2010]},
+    "band": {"drums": [], "perc": [2807, 2830], "bass": [], "gtr": {"pick": [333, 331], "strum": [334, 332]},
+             "keys": [], "strings": [493, 492, 494], "pad": [2132, 2594, 2117], "lead": [3, 90]},
+    "devotional": {"drums": [1226, 1225], "perc": [2830, 2807], "bass": [2537, 2491],
+                   "gtr": {"pick": [316, 2529], "strum": [317, 316]}, "keys": [2749],
+                   "strings": [493, 492], "pad": [784, 2132], "lead": [2010, 2011, 2749, 2428]},
+    "cinematic": {"drums": [1255, 1219], "perc": [2752, 2830], "bass": [491], "gtr": 0, "keys": [25, 26, 3],
+                  "strings": [486, 482, 481], "pad": [796, 773, 2117], "lead": [634, 629, 26]},
+    "remix": {"drums": [1238, 1237, 1239], "perc": [2449, 2807], "bass": [1822, 2543],
+              "gtr": {"pick": [1019, 1027], "strum": [1027, 1023]}, "keys": [130, 123, 108],
+              "strings": [481, 482], "pad": [778, 773, 2117], "lead": [3, 123]},
+    "retro": {"drums": [1218, 1220], "perc": [2807, 2808], "bass": [2538, 1760],
+              "gtr": {"pick": [333, 331], "strum": [334, 332]}, "keys": [90, 108],
+              "strings": [493, 494], "pad": [2594, 2132], "lead": [2011, 2010, 90]},
+    "indian": {"drums": [2420, 2423], "perc": [2830, 2807], "bass": [2537], "gtr": [2407, 2419],
+               "keys": [2749], "strings": [493, 492], "pad": [2418, 784], "lead": [2010, 2428, 2419]},
+}
+BAND_LABELS = {"unplugged": "Unplugged", "band": "Full band", "devotional": "Devotional", "cinematic": "Cinematic",
+               "remix": "Remix / dance", "retro": "Retro film", "indian": "Indian"}
+BAND_SOUNDS = BAND_POOLS  # moods available (kept name for callers)
+# Instruments that hold your chord instead of playing a pattern (harmonium sustains in devotional songs).
+BAND_HOLD = {"devotional": {"strings", "pad", "keys"}, "indian": {"strings", "pad", "keys"}}
+# Where each role's patterns come from (remix: synth comping instead of guitar).
+BAND_SOURCE = {"remix": {"gtr": ["SynCp", "Gtr"]}}
+FEEL_BAND = {"ballad": "unplugged", "devotional": "devotional", "indian": "indian", "cinematic": "cinematic",
+             "dance": "remix", "pop": "band", "": "band"}
+_PERF_BY_NO = {p["no"]: p for p in PERFS}
+
+
+def _role_arps(style, role, flavor=""):
+    parts = style["parts"]
+    for cat in BAND_SOURCE.get(flavor, {}).get(role, []):
+        if parts.get(cat):
+            return parts[cat]
+    if role in ("drums", "perc"):
+        dr = parts.get("Dr/Pc", [])
+        kit = [a for a in dr if not PERC_RX.search(a.get("sound") or "")]
+        perc = [a for a in dr if PERC_RX.search(a.get("sound") or "")]
+        # Families keep kit and percussion arps under one name; tell them apart by the sound they were made for,
+        # and when a family has no sound labels, the lower-numbered set is the kit.
+        return kit or (dr if role == "drums" else []) if role == "drums" else perc
+    if role == "bass":
+        return parts.get("Bass", [])
+    if role == "gtr":
+        return parts.get("Gtr", [])
+    if role == "keys":
+        return parts.get("Piano") or parts.get("Keys") or []
+    return []
+
+
+def _borrow(style, role, flavor):
+    """Same instrument from another groove in the same meter, nearest tempo; acoustic guitars first when unplugged."""
+    best, best_key = None, None
+    for f, s in STYLES.items():
+        if f == style["family"] or s["ts"] != style["ts"]:
+            continue
+        arps = _role_arps(s, role, flavor)
+        if not arps or not any(a["var"] in ("MA", "MB", "MC", "MD") for a in arps):
+            continue
+        acoustic = role == "gtr" and any(ACOUSTIC_GTR_RX.search(a.get("sound") or "") for a in arps)
+        k = (0 if (flavor == "unplugged" and acoustic) or role != "gtr" or flavor != "unplugged" else 1,
+             0 if s["sub"] == style["sub"] else 1,
+             1 if re.search(r"salsa|latin|reggae|merengue|bomba|montuno|guaguanco|samba|hip|trap|edm|house", f, re.I) else 0,
+             abs(s["tempo"] - style["tempo"]))
+        if best_key is None or k < best_key:
+            best, best_key = (f, arps), k
+    return best
+
+
+def _pick_sound(pool, role, tone):
+    """(perf no, reason, options) from a mood's pool for this song."""
+    if pool == 0:
+        return 0, "", []
+    if isinstance(pool, dict):
+        strum = bool(tone and tone.get("strummed"))
+        lst = pool["strum" if strum else "pick"]
+        opts = pool["strum"] + [x for x in pool["pick"] if x not in pool["strum"]]
+        why = "strummed part in the song" if strum else "picked / sparse part in the song"
+    else:
+        lst, opts, why = pool, list(pool), ""
+    if not lst:
+        return None, "", []
+    i = 0
+    if tone and len(lst) > 1 and role in ("keys", "strings", "pad", "drums", "gtr", "bass"):
+        i = min(len(lst) - 1, int(round(tone.get("brightness", 0.4) * (len(lst) - 1))))
+        why = ", ".join(x for x in (why, "brighter mix" if tone["brightness"] > 0.6 else "warmer mix" if tone["brightness"] < 0.35 else "") if x)
+    return lst[i], why, opts
+
+
+def band_plan(family, flavor="unplugged", perc=True, tone=None, overrides=None):
+    style = STYLES.get(family)
+    if not style:
+        return None
+    flavor = flavor if flavor in BAND_POOLS else "band"
+    pools = BAND_POOLS[flavor]
+    hold = BAND_HOLD.get(flavor, {"strings", "pad"})
+    overrides = overrides or {}
+    parts = []
+    for role, label in BAND_ROLES:
+        if (role == "perc" and not perc) or pools.get(role) == 0:
+            continue
+        label = {("remix", "gtr"): "Synth comp", ("devotional", "keys"): "Harmonium", ("indian", "keys"): "Harmonium",
+                 ("indian", "gtr"): "Santoor / sitar", ("indian", "pad"): "Tambura / pad", ("indian", "drums"): "Tabla"}.get((flavor, role), label)
+        row = {"role": role, "label": label, "cat": role, "scenes": [None] * 8, "hold": role in hold, "from": None}
+        if not row["hold"]:
+            arps = _role_arps(style, role, flavor)
+            src = family
+            if not arps:
+                b = _borrow(style, role, flavor)
+                if not b:
+                    continue  # nothing suitable in this meter (e.g. no percussion grooves): leave the Part out
+                src, arps = b
+            row["from"] = src if src != family else None
+            row["scenes"] = [{"no": a["no"], "name": a["name"], "var": a["var"]} if a else None for a in _scene_arps(arps)]
+            row["sound"] = next((a.get("sound") for a in arps if a.get("sound")), None)
+        no, why, opts = _pick_sound(pools.get(role, []), role, tone)
+        if not no and not row["hold"]:
+            p = resolve_sound({"drums": "Dr/Pc", "bass": "Bass", "gtr": "Gtr", "keys": "Piano", "perc": "Dr/Pc"}.get(role, role), row.get("sound"))
+            no, why = (p["no"] if p else None), "the sound this groove was written for"
+            opts = [no] if no else []
+        ov = overrides.get(role)
+        if ov and _PERF_BY_NO.get(ov.get("no")):
+            no, why = ov["no"], "your choice"
+            if no not in opts:
+                opts = [no] + opts
+        p = _PERF_BY_NO.get(no)
+        row["sound_no"], row["sound_name"], row["why"] = (p["no"], p["name"], why) if p else (None, None, "")
+        row["options"] = [{"no": o, "name": _PERF_BY_NO[o]["name"]} for o in opts if o in _PERF_BY_NO]
+        parts.append(row)
+    leads = [{"no": n, "name": _PERF_BY_NO[n]["name"]} for n in pools.get("lead", []) if n in _PERF_BY_NO]
+    return {"family": family, "ts": style["ts"], "tempo": style["tempo"], "sub": style["sub"], "flavor": flavor,
+            "flavor_label": BAND_LABELS[flavor], "scenes": [name for name, _ in SCENE_SLOTS], "parts": parts, "band": True,
+            "lead": leads[0] if leads else None, "leads": leads, "fx": BAND_FX.get(flavor, BAND_FX["band"]), "tone": tone}
+
+
+# Effects per mood. Types are (MSB, LSB) from the Effect Type List; sends are per-role scene values.
+BAND_FX = {
+    "unplugged": {"reverb": [0x01, 0x03], "reverb_name": "HD Hall", "variation": [0x02, 0x28], "variation_name": "Tempo Delay Stereo", "lead_var": 18},
+    "band": {"reverb": [0x01, 0x13], "reverb_name": "HD Room", "variation": [0x02, 0x28], "variation_name": "Tempo Delay Stereo", "lead_var": 12},
+    "devotional": {"reverb": [0x01, 0x03], "reverb_name": "HD Hall", "variation": [0x02, 0x28], "variation_name": "Tempo Delay Stereo", "lead_var": 30},
+    "cinematic": {"reverb": [0x01, 0x00], "reverb_name": "REV-X Hall", "variation": [0x02, 0x10], "variation_name": "Tempo Cross Delay", "lead_var": 34},
+    "remix": {"reverb": [0x01, 0x21], "reverb_name": "HD Plate", "variation": [0x02, 0x28], "variation_name": "Tempo Delay Stereo", "lead_var": 22},
+    "retro": {"reverb": [0x01, 0x20], "reverb_name": "R3 Plate", "variation": [0x02, 0x20], "variation_name": "Tempo Delay Mono", "lead_var": 24},
+    "indian": {"reverb": [0x01, 0x03], "reverb_name": "HD Hall", "variation": [0x02, 0x28], "variation_name": "Tempo Delay Stereo", "lead_var": 28},
+}

@@ -194,6 +194,7 @@ class Mixer {
     this.tracks = [...stems, "original"].map(name => ({name, a: null, vol: 1,
       mute: name === "instrumental" || (name === "original" && stems.length > 0), solo: false}));
     this.onTick = null; this.onKey = null; this.playing = false; this.duration = 0; this.key = 0;
+    window.__mixer = this;   // handy for debugging in the browser console
     this.render(); this.load();
   }
   render() {
@@ -299,16 +300,35 @@ class Mixer {
     $("#mxplay", this.el).disabled = false; $("#mxseek", this.el).disabled = false;
     this.tick();
   }
+  // Mute/solo/volume go through Web Audio gain nodes. The <audio> elements themselves always play
+  // unmuted at full volume: Android throttles muted media, which made a stem drift and sound phasey
+  // when it was unmuted again.
+  graph() {
+    if (this.ctx) return true;
+    try {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      for (const t of this.tracks) {
+        t.node = this.ctx.createMediaElementSource(t.a);
+        t.gain = this.ctx.createGain(); t.node.connect(t.gain).connect(this.ctx.destination);
+        t.a.muted = false; t.a.volume = 1;
+      }
+      return true;
+    } catch { this.ctx = null; return false; }
+  }
   applyGains() {
     const anySolo = this.tracks.some(t => t.solo);
     for (const t of this.tracks) {
       if (!t.a) continue;
       const on = anySolo ? t.solo && !t.mute : !t.mute;
-      t.a.muted = !on; t.a.volume = Math.max(0, Math.min(1, t.vol));
+      const g = on ? Math.max(0, Math.min(1.5, t.vol)) : 0;
+      if (t.gain) t.gain.gain.setTargetAtTime(g, this.ctx.currentTime, 0.02);
+      else { t.a.muted = !on; t.a.volume = Math.min(1, g); }
     }
+    if (this.playing) this.resync(true);
   }
   pos() { return this.tracks[0]?.a?.currentTime || 0; }
   async play() {
+    this.graph(); this.ctx?.resume(); this.applyGains();
     const p = this.pos();
     for (const t of this.tracks) if (Math.abs(t.a.currentTime - p) > 0.03) t.a.currentTime = p;
     this.playing = true; $("#mxplay", this.el).textContent = "❚❚";
@@ -319,14 +339,24 @@ class Mixer {
     for (const t of this.tracks) t.a?.pause();
     this.playing = false; $("#mxplay", this.el).textContent = "▶";
   }
-  seek(s) { for (const t of this.tracks) if (t.a) t.a.currentTime = s; this.tick(true); }
+  seek(s) { for (const t of this.tracks) if (t.a) { t.a.currentTime = s; t.a.playbackRate = 1; } this.tick(true); }
+  // Keep every stem locked to the first one: small drift is pulled in by nudging the playback rate
+  // (inaudible), bigger drift (or hard = after a change) by a seek.
+  resync(hard) {
+    const ref = this.tracks[0]?.a; if (!ref) return;
+    const p = ref.currentTime;
+    for (const t of this.tracks.slice(1)) {
+      if (t.a.paused) continue;
+      const d = t.a.currentTime - p;
+      if (Math.abs(d) > (hard ? 0.03 : 0.15)) { t.a.currentTime = p + 0.01; t.a.playbackRate = 1; }
+      else if (Math.abs(d) > 0.012) t.a.playbackRate = d > 0 ? 0.97 : 1.03;
+      else if (t.a.playbackRate !== 1) t.a.playbackRate = 1;
+    }
+  }
   tick(once) {
     if (this.dead) return;
     const p = this.pos();
-    // Keep stems locked to the first track; nudge any that drift by more than ~60 ms.
-    if (this.playing && !once) for (const t of this.tracks.slice(1)) {
-      if (!t.a.paused && Math.abs(t.a.currentTime - p) > 0.06) t.a.currentTime = p;
-    }
+    if (this.playing && !once) this.resync(false);
     this.onTick?.(p);
     if (!this.seeking) {
       $("#mxseek", this.el).value = this.duration ? Math.round(p / this.duration * 1000) : 0;
@@ -334,7 +364,7 @@ class Mixer {
     }
     if (!once) requestAnimationFrame(() => this.tick());
   }
-  destroy() { this.dead = true; for (const t of this.tracks) if (t.a) { t.a.pause(); t.a.removeAttribute("src"); t.a.load(); } }
+  destroy() { this.dead = true; for (const t of this.tracks) if (t.a) { t.a.pause(); t.a.removeAttribute("src"); t.a.load(); } this.ctx?.close(); }
 }
 
 // ---------------- MODX sound finder ----------------
@@ -374,6 +404,44 @@ const MIDI = {
       this.out.send([0xF0, 0x43, 0x30, 0x7F, 0x1C, 0x0D, ...addr, 0xF7]);
     });
   },
+  // Undo: copy the whole Performance edit buffer (Bulk Dump Request, address 04 04 00 00) before a send,
+  // and send that copy back to restore it. Keeps the last 3 copies on this device.
+  snapshot(timeout = 4000) {
+    const ins = [...(this.access?.inputs.values() || [])].filter(i => /modx|yamaha|montage/i.test(i.name) || this.access.inputs.size === 1);
+    if (!ins.length || !this.out) return Promise.resolve(null);
+    return new Promise(res => {
+      const msgs = [];
+      let idle;
+      const done = ok => { clearTimeout(idle); clearTimeout(t); ins.forEach(i => i.removeEventListener("midimessage", on)); res(ok && msgs.length > 2 ? msgs : null); };
+      const on = e => {
+        const d = e.data;
+        if (d[0] !== 0xF0 || d[1] !== 0x43 || (d[2] & 0xF0) !== 0x00 || d[3] !== 0x7F || d[4] !== 0x1C) return;
+        msgs.push([...d]);
+        if (d[8] === 0x05 && d[9] === 0x04) return done(true);        // Bulk Footer of the edit buffer
+        clearTimeout(idle); idle = setTimeout(() => done(true), 800);
+      };
+      const t = setTimeout(() => done(true), timeout);
+      ins.forEach(i => i.addEventListener("midimessage", on));
+      this.out.send([0xF0, 0x43, 0x20, 0x7F, 0x1C, 0x0D, 0x04, 0x04, 0x00, 0x00, 0xF7]);
+    });
+  },
+  saveSnapshot(msgs, label) {
+    try {
+      const list = JSON.parse(localStorage.getItem("sk_snaps") || "[]");
+      list.unshift({at: Date.now(), label, msgs});
+      localStorage.setItem("sk_snaps", JSON.stringify(list.slice(0, 3)));
+    } catch {}
+  },
+  snapshots() { try { return JSON.parse(localStorage.getItem("sk_snaps") || "[]"); } catch { return []; } },
+  async restore(i = 0) {
+    const out = await this.ensure(); if (!out) return false;
+    const snap = this.snapshots()[i]; if (!snap) { toast("No saved copy to restore"); return false; }
+    for (const msg of snap.msgs) { out.send(msg); await new Promise(r => setTimeout(r, 15)); }
+    const list = this.snapshots(); list.splice(i, 1);
+    try { localStorage.setItem("sk_snaps", JSON.stringify(list)); } catch {}
+    toast("Restored the Performance as it was before the send", 5000);
+    return true;
+  },
   async preset(n) {
     const out = await this.ensure(); if (!out) return;
     const ch = ((midiSettings().channel || 1) - 1) & 15;
@@ -384,12 +452,19 @@ const MIDI = {
 // Scene order: Intro, Main A, Main B, Main C, Fill A, Fill B, Break, Ending (scene index 0–7).
 // Intro: no bass. Main A (verse): sparse. Main C (chorus): loudest. Break: drums and bass drop out.
 const SCENE_MIX = {
+  // Arranger band (Intro, Verse=Main A, Pre-chorus=Main B, Chorus=Main C, Fill A, Fill B, Break, Ending)
+  perc:    {mute: [0, 1, 6, 7], vol: [90, 90, 92, 105, 105, 105, 90, 90]},
+  gtr:     {mute: [], vol: [100, 95, 100, 106, 104, 104, 100, 100]},
+  keys:    {mute: [], vol: [100, 92, 95, 100, 100, 100, 105, 100]},
+  strings: {mute: [1], vol: [85, 85, 88, 108, 100, 100, 105, 100]},
+  pad:     {mute: [], vol: [95, 85, 85, 82, 82, 82, 100, 95]},
   drums: {mute: [6], vol: [92, 95, 100, 112, 112, 112, 100, 105]},
   bass:  {mute: [0, 6], vol: [100, 100, 105, 112, 112, 112, 100, 105]},
   comp:  {mute: [], vol: [100, 95, 100, 108, 105, 105, 105, 100]},
   comp2: {mute: [0, 1, 6], vol: [100, 100, 95, 105, 105, 105, 100, 100]},
 };
-const SCENE_MIX_TEXT = "Scenes also change the mix: Intro without bass, Main A sparse (2nd keys/guitar out), Main C loudest, Break drops drums and bass.";
+const SCENE_MIX_TEXT = "Scenes also change the mix: Intro without bass, Verse sparse, Chorus fullest (strings and percussion in), Break drops drums and bass.";
+const roleOf = (row, compIdx) => row.role || (row.cat === "Dr/Pc" ? "drums" : row.cat === "Bass" ? "bass" : compIdx === 0 ? "comp" : "comp2");
 
 // Yamaha parameter change: F0 43 1n 7F 1C 0D a1 a2 a3 a4 data F7 (MODX M Data List, MIDI Data Format 3-5-3).
 const ymh = (addr, data) => [0xF0, 0x43, 0x10, 0x7F, 0x1C, 0x0D, ...addr, ...data, 0xF7];
@@ -406,16 +481,20 @@ function scenePlanMessages(plan, tempo, opts = {}) {
     const p = row.part - 1; used.add(p);
     part1(p, 0x00, 1);                                     // Part Switch on
     part1(p, 0x02, 1);                                     // Keyboard Control on (the keys trigger this Part's arps)
-    part1(p, 0x47, 1);                                     // Part Arp Switch on
-    if (opts.arpOnly !== false) part1(p, 0x48, 1);         // Arp Play Only: only the pattern sounds, not the held keys
-    row.scenes.forEach((no, i) => { if (no) msgs.push(ymh([0x10 + p, 0x00, 0x06, 0x44 + 2 * i], d14(no))); }); // Arp 1–8 Number
+    if (row.hold) {                                        // strings / pad: no pattern, they hold the chord you play
+      part1(p, 0x47, 0); part1(p, 0x48, 0);
+    } else {
+      part1(p, 0x47, 1);                                   // Part Arp Switch on
+      if (opts.arpOnly !== false) part1(p, 0x48, 1);       // Arp Play Only: only the pattern sounds, not the held keys
+      row.scenes.forEach((no, i) => { if (no) msgs.push(ymh([0x10 + p, 0x00, 0x06, 0x44 + 2 * i], d14(no))); }); // Arp 1–8 Number
+    }
     if (opts.split != null) limits(p, 0, opts.split - 1);
     else if (opts.resetLimits) limits(p, 0, 127);
   }
   if (opts.lead && opts.lead.part) {
     const p = opts.lead.part - 1; used.add(p);
     part1(p, 0x00, 1); part1(p, 0x02, 1); part1(p, 0x47, 0); part1(p, 0x48, 0);
-    limits(p, opts.split != null ? opts.split : 0, 127);
+    limits(p, opts.split != null && !opts.lead.full ? opts.split : 0, 127);
   }
   if (opts.othersOff) for (let p = 0; p < 16; p++) if (!used.has(p)) part1(p, 0x00, 0);
   if (opts.dynamics !== false) {
@@ -425,8 +504,8 @@ function scenePlanMessages(plan, tempo, opts = {}) {
     let comp = 0;
     for (const row of plan.parts) {
       if (!row.part) continue;
-      const role = row.cat === "Dr/Pc" ? "drums" : row.cat === "Bass" ? "bass" : comp++ === 0 ? "comp" : "comp2";
-      const d = SCENE_MIX[role];
+      const role = roleOf(row, row.role ? 0 : comp++);
+      const d = SCENE_MIX[role] || SCENE_MIX.comp;
       for (let c = 0; c < 8; c++) { mute(row.part - 1, c, d.mute.includes(c)); vol(row.part - 1, c, d.vol[c]); }
     }
     if (opts.lead && opts.lead.part) for (let c = 0; c < 8; c++) { mute(opts.lead.part - 1, c, false); vol(opts.lead.part - 1, c, 100); }
@@ -437,10 +516,102 @@ function scenePlanMessages(plan, tempo, opts = {}) {
     msgs.push(ymh([0x06, 0x02, c, 0x02], [1]));      // Scene Arpeggio Memorize Switch on
     msgs.push(ymh([0x06, 0x03, c, 0x00], [0, c]));   // Scene c+1 → Arp Select c+1
   }
+  if (plan.band) msgs.push(...layerMessages(plan, opts));
   msgs.push(ymh([0x06, 0x00, 0x01, 0x09], [1]));     // Arpeggio Master Switch on
   if (tempo) msgs.push(ymh([0x06, 0x00, 0x02, 0x1E], d14(Math.round(Math.min(300, Math.max(5, tempo)))))); // Tempo
   msgs.push(ymh([0x06, 0x00, 0x02, 0x2A], [0, 0])); // Select Scene 1 so you start at the intro
   return msgs;
+}
+
+
+// ---------- extra MODX layers for arranger band plans (all addresses from the MODX M Data List) ----------
+// Scene order: Intro, Verse (Main A), Pre-chorus (Main B), Chorus (Main C), Fill A, Fill B, Break, Ending.
+const SCENE_INTENSITY = [0.35, 0.45, 0.6, 0.9, 0.85, 0.85, 0.4, 0.7];
+const SUPER_KNOB_SCENES = [220, 320, 520, 820, 780, 780, 260, 600];     // 0–1023 per scene
+const ARP_VEL = [85, 88, 95, 108, 110, 110, 80, 100];                    // % per scene
+const ARP_GATE = [100, 85, 95, 100, 100, 100, 105, 110];
+const REV_SEND = {drums: 18, perc: 22, bass: 4, gtr: 30, keys: 34, strings: 48, pad: 55, comp: 30, comp2: 30};
+const SCENE_REV_RETURN = [80, 64, 66, 70, 70, 70, 85, 85];
+const WIND_RX = /flute|shehnai|whistle|sax|clari|ney|zurna|pungi|violin|cello|harmonica|lead|oboe|trumpet/i;
+const LAYER_TEXT = {
+  expression: "Each scene changes the tone too: darker and roomier intro and break, brighter chorus.",
+  groove: "Arps play softer and shorter in verses, harder in chorus and fills; swing follows the song.",
+  superKnob: "Super Knob = band intensity (opens filters, raises volume and arp velocity); each scene sets its starting point. Common knob 1 is named “Intensity”.",
+  touch: "Play harder with the left hand to bring in guitar, strings and percussion.",
+  motion: "Pads and strings move with the Motion Sequencer in pre-chorus, chorus and fills (when the sound has motion).",
+};
+
+function layerMessages(plan, opts) {
+  const m = [], P = (p, a, b, off, data) => m.push(ymh([0x10 + p, a, b, off], data));
+  const C = (a, b, off, data) => m.push(ymh([0x06, a, b, off], data));
+  const band = plan.parts.filter(r => r.part);
+  const lead = opts.lead && opts.lead.part ? opts.lead.part - 1 : null;
+  C(0x00, 0x01, 0x03, [0]);                                   // Scene Mixing / AEG Value Mode: Absolute
+  if (plan.fx) {                                              // effects for the mood
+    C(0x00, 0x01, 0x05, [1]); C(0x00, 0x01, 0x06, [1]);       // Reverb / Variation switch on
+    C(0x00, 0x07, 0x00, plan.fx.reverb); C(0x00, 0x08, 0x00, plan.fx.variation);
+    C(0x00, 0x02, 0x32, [0, 72]); C(0x00, 0x02, 0x38, [0, 60]); // Reverb / Variation Return
+  }
+  if (opts.groove !== false && opts.swing != null) C(0x00, 0x02, 0x26, d14(128 + opts.swing));   // Swing Offset
+  for (let c = 0; c < 8; c++) {
+    if (opts.expression !== false) { C(0x02, c, 0x06, [1]); C(0x03, c, 0x0A, [0, SCENE_REV_RETURN[c]]); }  // AEG memorize, scene reverb return
+    if (opts.groove !== false) C(0x02, c, 0x07, [1]);          // Arp/MS FX memorize (per-scene arp velocity / gate)
+    if (opts.superKnob !== false) { C(0x02, c, 0x04, [1]); C(0x03, c, 0x04, d14(SUPER_KNOB_SCENES[c])); }
+    if (opts.motion !== false) { C(0x02, c, 0x03, [1]); C(0x02, c, 0x01, [[2, 3, 4, 5].includes(c) ? 1 : 0]); }
+  }
+  if (opts.motion !== false) C(0x00, 0x01, 0x0A, [1]);         // Motion Seq master on
+  band.forEach((row, k) => {
+    const p = row.part - 1, role = row.role || "comp", melodic = ["gtr", "keys", "strings", "pad", "comp", "comp2"].includes(role);
+    for (let c = 0; c < 8; c++) {
+      if (opts.expression !== false) {
+        const bright = melodic ? Math.round((SCENE_INTENSITY[c] - 0.65) * 36) : 0;
+        P(p, 0x03, c, 0x0C, [0, 64 + bright]);                                    // Filter Cutoff offset
+        const slow = (role === "pad" || role === "strings") && [0, 6].includes(c) ? 18 : 0;
+        P(p, 0x03, c, 0x12, [0, 64 + slow]);                                      // AEG Attack offset
+        P(p, 0x03, c, 0x18, [0, 64 + (c === 7 && melodic ? 20 : 0)]);             // AEG Release offset (longer ending)
+        P(p, 0x03, c, 0x06, [0, Math.min(127, (REV_SEND[role] ?? 30) + ([0, 6, 7].includes(c) ? 14 : 0))]);  // Reverb Send
+        P(p, 0x03, c, 0x08, [0, 0]);                                              // Variation Send
+      }
+      if (opts.groove !== false && !row.hold) {
+        P(p, 0x03, c, 0x36, d14(ARP_VEL[c])); P(p, 0x03, c, 0x34, d14(ARP_GATE[c])); P(p, 0x03, c, 0x32, [0, 10]);  // vel, gate, unit = common
+      }
+    }
+    // Super Knob → common knob 1 → this Part's knob 1 → volume + brightness (or arp velocity for drums/bass).
+    if (opts.superKnob !== false) {
+      const bb = 31 - k;                                                          // common controller boxes 25–31
+      C(0x05, bb, 0x00, [0, 1]); C(0x05, bb, 0x02, [0, 8]); C(0x05, bb, 0x04, d14(226 + p * 8));
+      C(0x05, bb, 0x06, [0, 0]); C(0x05, bb, 0x08, [0, 0]); C(0x05, bb, 0x0E, [0, 0]); C(0x05, bb, 0x10, d14(128 + 127));
+      const box = (bx, dest, ratio) => {                                          // Part controller boxes 31 and 30
+        P(p, 0x05, bx, 0x00, [0, 1]); P(p, 0x05, bx, 0x02, [0, 8]); P(p, 0x05, bx, 0x04, d14(dest));
+        P(p, 0x05, bx, 0x06, [0, 0]); P(p, 0x05, bx, 0x08, [0, 0]); P(p, 0x05, bx, 0x0E, [0, 0]); P(p, 0x05, bx, 0x10, d14(128 + ratio));
+      };
+      box(31, 55, role === "pad" || role === "strings" ? 30 : 18);               // Part Volume
+      box(30, melodic ? 85 : 362, melodic ? 40 : 36);                             // Element Cutoff, or Arp Velocity
+    }
+    // Touch: harder left hand brings in guitar, strings and percussion.
+    const vlo = opts.touch ? ({perc: 96, gtr: 70, strings: 84}[role] || 1) : 1;
+    P(p, 0x00, 0x02, 0x04, [0, vlo]); P(p, 0x00, 0x02, 0x06, [0, 127]);           // Velocity Limit Low / High
+    if (opts.motion !== false) P(p, 0x00, 0x01, 0x07, [role === "pad" || role === "strings" ? 1 : 0]);   // Motion Seq Part Switch
+  });
+  if (opts.superKnob !== false) {
+    C(0x00, 0x01, 0x0B, [1]);                                                     // Common knob 1 follows the Super Knob
+    [..."Intensity".padEnd(16, " ")].forEach((ch, i) => C(0x04, 0x00, i, [ch.charCodeAt(0)]));   // knob 1 name
+    C(0x00, 0x0D, 0x00, d14(SUPER_KNOB_SCENES[0]));                               // Super Knob value
+  }
+  if (lead != null) {
+    for (let c = 0; c < 8; c++) {
+      if (opts.expression !== false) {
+        P(lead, 0x03, c, 0x0C, [0, 64]); P(lead, 0x03, c, 0x12, [0, 64]); P(lead, 0x03, c, 0x18, [0, 64]);
+        P(lead, 0x03, c, 0x06, [0, 40]); P(lead, 0x03, c, 0x08, [0, plan.fx?.lead_var ?? 0]);
+      }
+    }
+    if (opts.lead.wind) {                                                         // melody instruments: mono with glide, ±2 bend
+      P(lead, 0x00, 0x01, 0x09, [0]); P(lead, 0x00, 0x01, 0x0A, [1]); P(lead, 0x00, 0x03, 0x08, [0, 24]);
+      P(lead, 0x00, 0x03, 0x00, [0, 66]); P(lead, 0x00, 0x03, 0x02, [0, 62]);
+    }
+    if (opts.motion !== false) P(lead, 0x00, 0x01, 0x07, [0]);
+  }
+  return m;
 }
 
 // Loads sounds (optional) then writes the plan into the Performance open on the MODX. Returns true on success.
@@ -452,6 +623,10 @@ async function sendPlanToModx(plan, bpm, opts = {}) {
   const wait = ms => new Promise(r => setTimeout(r, ms));
   const kc = (p, on) => out.send(ymh([0x10 + p, 0x00, 0x01, 0x02], [on ? 1 : 0]));
   try {
+    toast("Saving a copy of your Performance first (for Undo)…", 3000);
+    const snap = await MIDI.snapshot();
+    if (snap) MIDI.saveSnapshot(snap, plan.family || "send");
+    else if (!confirm("The MODX didn't send a copy of the Performance, so Undo won't be available for this send (check Utility → MIDI: Device Number All, Receive Bulk On). Send anyway?")) return false;
     const loads = [];
     if (opts.withSounds !== false) {
       for (const r of plan.parts) if (r.part && r.sound_no) loads.push({part: r.part, no: r.sound_no});
@@ -478,9 +653,11 @@ async function sendPlanToModx(plan, bpm, opts = {}) {
       await wait(300);
     }
     toast("Setting arps and scenes…", 3000);
-    for (const m of scenePlanMessages(plan, bpm, opts)) { out.send(m); await wait(8); }
+    const all = scenePlanMessages(plan, bpm, opts);
+    for (const [i, m] of all.entries()) { out.send(m); await wait(6); if (i % 150 === 0) toast(`Setting arps, scenes and layers… ${Math.round(i / all.length * 100)}%`, 2000); }
     await wait(300);
     const report = await verifyPlan(plan, opts);
+    if (plan.band) report.layers = Object.entries(LAYER_TEXT).filter(([k]) => k === "touch" ? opts.touch : opts[k] !== false).map(([, t]) => t);
     showSendReport(report);
     return true;
   } catch (e) { toast("Sending failed: " + e.message + " — allow full MIDI (SysEx) access in Chrome.", 7000); return false; }
@@ -499,12 +676,12 @@ async function verifyPlan(plan, opts) {
       name += String.fromCharCode(d[0]);
     }
     const arps = [];
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < (r.hold ? 0 : 8); i++) {
       const d = await MIDI.read([0x10 + p, 0x00, 0x06, 0x44 + 2 * i], 300);
       arps.push(d ? (d[0] << 7) | d[1] : null);
     }
     rows.push({part: r.part, label: r.label, want: r.sound_name, name: name == null ? null : name.trim(),
-      arpsOk: arps.every((n, i) => n === (r.scenes[i] || 0)), arps, wantArps: r.scenes,
+      arpsOk: r.hold || arps.every((n, i) => n === (r.scenes[i] || 0)), arps, wantArps: r.scenes,
       soundOk: name == null || !r.sound_name || name.toLowerCase().includes(r.sound_name.toLowerCase().slice(0, 6))});
   }
   return rows;
@@ -520,10 +697,12 @@ function showSendReport(rows) {
       </tbody></table>
       ${rows.every(r => r.arpsOk) ? "" : `<div class="small" style="color:var(--danger);margin-top:6px">Some arps didn't stick. Check Utility → Settings → MIDI: Device Number = All (or 1), and send again.</div>`}`
     : `<div class="small muted" style="margin-top:8px">The MODX didn't answer the check (it only answers when its MIDI Device Number is All or 1). The settings were still sent.</div>`}
+    ${rows.layers?.length ? `<ul class="small" style="margin:8px 0 0 18px;padding:0">${rows.layers.map(t => `<li>${esc(t)}</li>`).join("")}</ul>` : ""}
     <div class="small" style="margin-top:8px">${SCENE_MIX_TEXT} Hold a chord${rows.length ? " in your left hand" : ""} and step through scenes 1–8. Press <b>STORE</b> on the MODX to keep it.</div>
-    <div class="row" style="margin-top:12px"><span class="grow"></span><button class="btn primary" id="srok">OK</button></div>`;
+    <div class="row" style="margin-top:12px">${MIDI.snapshots().length ? `<button class="btn" id="srundo">↶ Undo this send</button>` : ""}<span class="grow"></span><button class="btn primary" id="srok">OK</button></div>`;
   document.body.append(dlg);
   $("#srok", dlg).onclick = () => dlg.close();
+  $("#srundo", dlg)?.addEventListener("click", async () => { if (await MIDI.restore(0)) dlg.close(); });
   dlg.addEventListener("close", () => dlg.remove());
   dlg.showModal();
 }
@@ -534,13 +713,27 @@ const SPLIT_CHOICES = [null, 48, 53, 54, 55, 60];
 
 // ---------------- Auto-build ----------------
 
+const BAND_MOODS = [["unplugged", "Unplugged"], ["band", "Full band"], ["devotional", "Devotional"], ["cinematic", "Cinematic"], ["remix", "Remix / dance"], ["retro", "Retro film"], ["indian", "Indian"], ["", "Groove only"]];
+const BAND_HELP = {
+  unplugged: "Brushes, percussion, acoustic bass, steel guitar, felt piano, strings and pad.",
+  band: "The groove's own drums, bass, guitar and keys, plus percussion, strings and pad.",
+  devotional: "Soft brushes, percussion, acoustic bass, fingered guitar, harmonium holding chords, strings and pad; flute melody.",
+  cinematic: "Epic kit, orchestral percussion, orchestral basses, felt piano, cinema strings and film pad; cinematic flutes.",
+  remix: "EDM kit, shakers, synth bass, synth comping, EP, big strings and pad.",
+  retro: "Old film-song band: real kit, finger bass, clean guitar, tine EP, strings and pad; wood flute melody.",
+  indian: "Tabla or dhol kit, percussion, acoustic bass, santoor/sitar patterns, harmonium and tambura holding chords, strings; flute or shehnai melody. (For real thekas, use your Tabla studio arps.)",
+};
 const AUTO_FEELS = [["", "Auto"], ["pop", "Pop / rock"], ["ballad", "Ballad"], ["devotional", "Devotional"], ["cinematic", "Cinematic"], ["dance", "Dance"], ["indian", "Indian"]];
 
 async function openAutoBuild({sid, meter, bpm, onApply}) {
   const prefs = (() => { try { return JSON.parse(localStorage.getItem("sk_auto") || "{}"); } catch { return {}; } })();
   const st = {feel: prefs.feel || "", split: prefs.split === undefined ? 54 : prefs.split, lead: prefs.lead?.keep || prefs.lead?.v2 ? prefs.lead : {keep: true, v2: true},
-    tabla: prefs.tabla || {use: false, first: 1, kit: 2813}, othersOff: prefs.othersOff !== false, useSections: true};
-  const savePrefs = () => { try { localStorage.setItem("sk_auto", JSON.stringify({feel: st.feel, split: st.split, lead: st.lead, tabla: st.tabla, othersOff: st.othersOff})); } catch {} };
+    tabla: prefs.tabla || {use: false, first: 1, kit: 2813}, othersOff: prefs.othersOff !== false, useSections: true,
+    band: prefs.band ?? "", bandAuto: prefs.bandAuto !== false, bothHands: !!prefs.bothHands,
+    layers: {expression: true, groove: true, superKnob: true, touch: false, motion: true, ...(prefs.layers || {})}};
+  const FEEL_BAND = {ballad: "unplugged", devotional: "devotional", indian: "indian", cinematic: "cinematic", dance: "remix", pop: "band", "": "band"};
+  if (st.bandAuto) st.band = FEEL_BAND[st.feel] ?? "band";
+  const savePrefs = () => { try { localStorage.setItem("sk_auto", JSON.stringify({feel: st.feel, split: st.split, lead: st.lead, tabla: st.tabla, othersOff: st.othersOff, band: st.band, bandAuto: st.bandAuto, bothHands: st.bothHands, layers: st.layers})); } catch {} };
   const dlg = document.createElement("dialog"); dlg.className = "mdlg finder";
   dlg.innerHTML = `<div class="row"><h2 class="grow" style="margin:0">✨ Auto-build</h2><button class="btn sm" id="ax" aria-label="Close">✕</button></div>
     <div id="abody"><div class="empty">Listening to the song… the first time takes up to a minute.</div></div>`;
@@ -551,18 +744,19 @@ async function openAutoBuild({sid, meter, bpm, onApply}) {
   let r = null, chosen = null, plan = null;
 
   const load = async refresh => {
-    try { r = await api(`songs/${sid}/autobuild`, {method: "POST", json: {feel: st.feel, refresh: !!refresh}}); }
+    try { r = await api(`songs/${sid}/autobuild`, {method: "POST", json: {feel: st.feel, refresh: !!refresh, band: st.band}}); }
     catch (e) { $("#abody", dlg).innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
     chosen = r.styles[0]?.family || null;
     plan = r.plan ? toPlan(r.plan) : null;
     draw();
   };
-  const toPlan = p => ({family: p.family, ts: p.ts, tempo: p.tempo, parts: p.parts.map((x, i) => ({
-    cat: x.cat, label: x.label, sound: x.sound, sound_no: x.sound_no, sound_name: x.sound_name,
-    names: x.scenes.map(y => y && y.name), scenes: x.scenes.map(y => y && y.no), part: i < 4 ? i + 2 : 0}))});
+  const toPlan = p => ({family: p.family, ts: p.ts, tempo: p.tempo, band: !!p.band, flavor: p.flavor, lead: p.lead, leads: p.leads || [], fx: p.fx, tone: p.tone,
+    parts: p.parts.map((x, i) => ({options: x.options || [], why: x.why || "",
+    cat: x.cat, role: x.role, hold: !!x.hold, from: x.from, label: x.label, sound: x.sound, sound_no: x.sound_no, sound_name: x.sound_name,
+    names: x.scenes.map(y => y && y.name), scenes: x.scenes.map(y => y && y.no), part: i < (p.band ? 7 : 4) ? i + 2 : 0}))});
   const applyTabla = p => {
     if (!st.tabla.use || !p) return p;
-    const drums = p.parts.find(x => x.cat === "Dr/Pc");
+    const drums = p.parts.find(x => x.cat === "Dr/Pc" || x.role === "drums");
     if (!drums) return p;
     const first = 12032 + Math.max(0, Math.min(255, (st.tabla.first || 1) - 1));   // User arpeggio numbers start at 12032
     return {...p, parts: p.parts.map(x => x !== drums ? x : {...x, label: "Tabla (your arps)", sound: null,
@@ -587,6 +781,10 @@ async function openAutoBuild({sid, meter, bpm, onApply}) {
             <span class="grow"><b>${esc(x.family)}</b>${i === 0 ? ' <span class="chip ready">best match</span>' : ""}<br>
             <span class="small muted">${esc(x.ts)} · ${x.tempo} BPM · ${esc(x.instruments.join(", "))}</span><br>
             <span class="small">${esc(x.why.join(" · ") || "—")}</span></span></label>`).join("") || '<div class="muted small">No styles in this meter.</div>'}</div>
+          <h3 style="margin-top:12px">Band</h3>
+          <div class="chipsel" id="aband">${BAND_MOODS.map(([k, v]) => `<button class="chipb ${k === st.band ? "on" : ""}" data-b="${k}">${v}</button>`).join("")}</div>
+          <div class="small muted" style="margin-top:4px">${st.band ? `${esc(BAND_HELP[st.band])} The band sits on Parts 2–8 and follows your left hand.` : "Only the instruments the groove has, on Parts 2–5."}
+            ${st.bandAuto ? " Picked from the feel; tap one to choose yourself." : ""}</div>
           <h3 style="margin-top:12px">Playing setup</h3>
           <label class="f">Split point (left hand plays the band)</label>
           <select id="asplit">${SPLIT_CHOICES.map(n => `<option value="${n ?? ""}" ${n === st.split ? "selected" : ""}>${n == null ? "No split — whole keyboard" : `${noteName(n)} — left hand below`}</option>`).join("")}</select>
@@ -594,17 +792,26 @@ async function openAutoBuild({sid, meter, bpm, onApply}) {
           <div class="row"><span class="grow" id="alead">${st.split == null ? '<span class="muted">— no split</span>' : st.lead.keep ? 'Keep Part 1 of the Performance you have open' : `${esc(st.lead.name)} <span class="muted">#${st.lead.no}</span>`}</span>
             ${st.split != null && !st.lead.keep ? `<button class="btn sm" id="aleadkeep">Keep mine</button>` : ""}
             <button class="btn sm" id="aleadpick" ${st.split == null ? "disabled" : ""}>Change</button></div>
-          ${st.feel === "indian" ? `<label class="chk"><input type="checkbox" id="atabla" ${st.tabla.use ? "checked" : ""}> Use my tabla arps for drums: User arp
+          ${st.split != null && plan?.leads?.length ? `<div class="row" style="margin-top:4px;gap:6px"><span class="small muted">Melody for this mood:</span>${plan.leads.map(l => `<button class="btn sm leadopt ${!st.lead.keep && st.lead.no === l.no ? "primary" : ""}" data-no="${l.no}" data-name="${esc(l.name)}">${esc(l.name)}</button>`).join("")}</div>` : ""}
+          ${st.feel === "indian" || st.band === "indian" ? `<label class="chk"><input type="checkbox" id="atabla" ${st.tabla.use ? "checked" : ""}> Use my tabla arps for drums: User arp
             <input id="atfirst" type="number" min="1" max="249" value="${st.tabla.first}" style="width:60px"> onwards</label>
             <div class="small muted">Make them in the Tabla tab (S1–S8 → 8 consecutive user arps).</div>` : ""}
+          ${st.split != null ? `<label class="chk"><input type="checkbox" id="aboth" ${st.bothHands ? "checked" : ""}> My right-hand sound also plays under the split (play your own left-hand arpeggios; the band still follows the left hand)</label>` : ""}
           <label class="chk"><input type="checkbox" id="aoff" ${st.othersOff ? "checked" : ""}> Switch off all other Parts</label>
+          ${st.band ? `<h3 style="margin-top:12px">MODX layers</h3>
+            ${[["expression", "Scene tone and effects"], ["groove", "Groove feel (arp dynamics, swing)"], ["superKnob", "Super Knob = intensity"], ["motion", "Moving pads (Motion Seq)"], ["touch", "Touch brings in instruments"]].map(([k, t]) =>
+              `<label class="chk" title="${esc(LAYER_TEXT[k])}"><input type="checkbox" class="alayer" data-k="${k}" ${st.layers[k] ? "checked" : ""}> ${t}</label>`).join("")}
+            ${plan?.fx ? `<div class="small muted">Effects: ${esc(plan.fx.reverb_name)} reverb, ${esc(plan.fx.variation_name)} on the melody.</div>` : ""}` : ""}
         </div>
         <div>
           <h3>Plan</h3>
           ${finalPlan ? `<div class="ptable"><table class="sec plan"><thead><tr><th>Part</th><th>Instrument</th><th>Sound</th>${["Intro", "Main A", "Main B", "Main C", "Fill A", "Fill B", "Break", "Ending"].map((n, i) => `<th>S${i + 1}<br><span class="muted">${n}</span></th>`).join("")}</tr></thead><tbody>
-            ${finalPlan.parts.filter(x => x.part).map(x => `<tr><td>${x.part}</td><td><b>${esc(x.label)}</b></td><td class="small">${esc(x.sound_name || "–")}</td>${x.scenes.map(n => `<td class="an">${n || "–"}</td>`).join("")}</tr>`).join("")}
+            ${finalPlan.parts.filter(x => x.part).map(x => `<tr><td>${x.part}</td><td><b>${esc(x.label)}</b>${x.from ? `<br><span class="small muted">from ${esc(x.from)}</span>` : ""}</td><td class="small">${x.options?.length ? `<select class="sndsel" data-role="${esc(x.role || "")}" aria-label="${esc(x.label)} sound">
+              ${x.options.map(o => `<option value="${o.no}" ${o.no === x.sound_no ? "selected" : ""}>${esc(o.name)}</option>`).join("")}
+              ${x.options.some(o => o.no === x.sound_no) ? "" : `<option value="${x.sound_no}" selected>${esc(x.sound_name || "")}</option>`}
+              <option value="search">Search all sounds…</option></select>${x.why ? `<div class="muted" style="font-size:11px">${esc(x.why)}</div>` : ""}` : esc(x.sound_name || "–")}</td>${x.hold ? `<td colspan="8" class="small muted">holds the chord you play · ${SCENE_MIX[x.role]?.mute.length ? "out in " + SCENE_MIX[x.role].mute.map(i => ["Intro", "Verse", "Pre", "Chorus", "Fill A", "Fill B", "Break", "Ending"][i]).join(", ") : "every scene"}</td>` : x.scenes.map(n => `<td class="an">${n || "–"}</td>`).join("")}</tr>`).join("")}
             ${st.split != null ? `<tr><td>${leadPart}</td><td><b>Right hand</b></td><td class="small">${st.lead.keep ? "(yours)" : esc(st.lead.name)}</td><td colspan="8" class="small muted">plays from ${noteName(st.split)} up, no arp</td></tr>` : ""}
-          </tbody></table></div><div class="small muted" style="margin-top:6px">${SCENE_MIX_TEXT}</div>` : '<div class="muted small">No plan.</div>'}
+          </tbody></table></div><div class="small muted" style="margin-top:6px">${finalPlan.tone ? `Sounds picked from the song: ${finalPlan.tone.brightness > 0.6 ? "bright" : finalPlan.tone.brightness < 0.35 ? "warm" : "balanced"} mix, ${finalPlan.tone.strummed ? "strummed" : "picked/sparse"} guitar/keys${finalPlan.tone.sustain > 0.6 ? ", lots of sustained strings/pads" : ""}. ` : ""}Change any sound in the list; StageKit remembers it for this song. ${SCENE_MIX_TEXT}</div>` : '<div class="muted small">No plan.</div>'}
           <h3 style="margin-top:14px">Sections → scenes</h3>
           ${r.sections.length ? `<table class="sec"><thead><tr><th>Section</th><th>Starts</th><th>Scene</th><th>Chords</th></tr></thead><tbody>
             ${r.sections.map(x => `<tr><td><b>${esc(x.name)}</b>${x.cue ? `<br><span class="small muted">${esc(x.cue)}</span>` : ""}</td><td>${fmtTime(x.start)}</td><td>S${x.scene}</td><td class="small">${esc(x.chords || "")}</td></tr>`).join("")}
@@ -616,19 +823,44 @@ async function openAutoBuild({sid, meter, bpm, onApply}) {
         </div>
       </div>`;
     $("#arefresh", dlg).onclick = e => { e.preventDefault(); $("#abody", dlg).innerHTML = '<div class="empty">Re-analysing…</div>'; load(true); };
-    $$("#afeel .chipb", dlg).forEach(b => b.onclick = () => { st.feel = b.dataset.f; savePrefs(); $("#abody", dlg).innerHTML = '<div class="empty">Matching styles…</div>'; load(false); });
+    $$("#afeel .chipb", dlg).forEach(b => b.onclick = () => { st.feel = b.dataset.f; if (st.bandAuto) st.band = FEEL_BAND[st.feel] ?? "band"; savePrefs(); $("#abody", dlg).innerHTML = '<div class="empty">Matching styles…</div>'; load(false); });
     $$("input[name=ast]", dlg).forEach(i => i.onchange = async () => {
-      chosen = i.value; plan = toPlan(await api(`modx/scene-plan?family=${encodeURIComponent(chosen)}`)); draw();
+      chosen = i.value; plan = toPlan(await api(`modx/scene-plan?family=${encodeURIComponent(chosen)}&band=${st.band}&sid=${sid}`)); draw();
+    });
+    $$("#aband .chipb", dlg).forEach(b => b.onclick = async () => {
+      st.band = b.dataset.b; st.bandAuto = false; savePrefs();
+      if (chosen) plan = toPlan(await api(`modx/scene-plan?family=${encodeURIComponent(chosen)}&band=${st.band}&sid=${sid}`));
+      draw();
     });
     $("#asplit", dlg).onchange = e => { st.split = e.target.value === "" ? null : +e.target.value; savePrefs(); draw(); };
     $("#aleadpick", dlg).onclick = () => openFinder({meter, bpm, onUse: p => { st.lead = {no: p.no, name: p.name, v2: true}; savePrefs(); draw(); }, onArp: () => {}});
+    $$(".leadopt", dlg).forEach(b => b.onclick = () => { st.lead = {no: +b.dataset.no, name: b.dataset.name, v2: true}; savePrefs(); draw(); });
+    $$(".sndsel", dlg).forEach(sel => sel.onchange = () => {
+      const row = plan.parts.find(x => x.role === sel.dataset.role); if (!row) return;
+      const setSound = async (no, name) => {
+        row.sound_no = no; row.sound_name = name; row.why = "your choice";
+        if (!row.options.some(o => o.no === no)) row.options.unshift({no, name});
+        try {   // remember per song and mood
+          const cur = (await api(`songs/${sid}`)).card.sound_overrides || {};
+          const mood = {...(cur[st.band] || {}), [row.role]: {no, name}};
+          await api(`songs/${sid}`, {method: "PATCH", json: {card: {sound_overrides: {...cur, [st.band]: mood}}}});
+        } catch {}
+        draw();
+      };
+      if (sel.value === "search") return openFinder({meter, bpm, onUse: p => setSound(p.no, p.name), onArp: () => {}});
+      setSound(+sel.value, sel.options[sel.selectedIndex].text);
+    });
+    $("#aboth", dlg)?.addEventListener("change", e => { st.bothHands = e.target.checked; savePrefs(); });
+    $$(".alayer", dlg).forEach(c => c.onchange = () => { st.layers[c.dataset.k] = c.checked; savePrefs(); });
     $("#aleadkeep", dlg)?.addEventListener("click", () => { st.lead = {keep: true, v2: true}; savePrefs(); draw(); });
     $("#aoff", dlg).onchange = e => { st.othersOff = e.target.checked; savePrefs(); };
     $("#atabla", dlg)?.addEventListener("change", e => { st.tabla.use = e.target.checked; savePrefs(); draw(); });
     $("#atfirst", dlg)?.addEventListener("change", e => { st.tabla.first = Math.max(1, Math.min(249, +e.target.value || 1)); savePrefs(); draw(); });
     $("#asecs", dlg)?.addEventListener("change", e => { st.useSections = e.target.checked; });
     const result = () => ({plan: dlg._final.plan, sections: st.useSections ? r.sections : null,
-      opts: {split: st.split, lead: st.split != null ? {part: dlg._final.leadPart, sound_no: st.lead.keep ? null : st.lead.no, name: st.lead.name} : null,
+      opts: {split: st.split, lead: st.split != null ? {part: dlg._final.leadPart, sound_no: st.lead.keep ? null : st.lead.no, name: st.lead.name, full: st.bothHands,
+          wind: !st.lead.keep && WIND_RX.test(st.lead.name || "")} : null,
+        ...st.layers, swing: r.groove ? (r.groove.feel === "swung" ? 24 : 0) : null,
         othersOff: st.othersOff, withSounds: true, resetLimits: st.split == null}});
     $("#aapply", dlg).onclick = async () => { await onApply(result(), false); dlg.close(); };
     $("#asend", dlg).onclick = async () => {
@@ -984,7 +1216,7 @@ async function songView(sid) {
             <div class="prf" style="grid-column:span 3;align-self:end"><button class="btn" id="finder" type="button">🔎 Find a sound for this song</button></div>
           </div>
           <div class="small muted" style="margin-top:4px" id="modehelp"></div>
-          <div class="row" style="margin-top:8px">${s.status === "ready" ? `<button class="btn primary" id="autobtn" type="button">✨ Auto-build</button>` : ""}<button class="btn" id="scenebtn" type="button">🎛 Build scenes by hand</button>
+          <div class="row" style="margin-top:8px">${s.status === "ready" ? `<button class="btn primary" id="autobtn" type="button">✨ Auto-build</button>` : ""}<button class="btn" id="scenebtn" type="button">🎛 Build scenes by hand</button>${MIDI.snapshots().length ? `<button class="btn" id="undobtn" type="button" title="Put the MODX Performance back as it was before the last send">↶ Undo last send</button>` : ""}
             <span class="small muted" id="planinfo">${c.scene_plan ? `Plan: ${esc(c.scene_plan.family)}` : ""}</span></div>
           <h2>Sections and scenes</h2>
           <table class="sec"><thead><tr><th>Section</th><th>Scene</th><th>Chords / cue</th><th></th></tr></thead><tbody id="secs"></tbody></table>
@@ -1055,6 +1287,7 @@ async function songView(sid) {
         mixer?.destroy(); render(); toast(sent ? "Applied and sent — press STORE on the MODX to keep it" : "Applied to the song");
       }});
     });
+    $("#undobtn")?.addEventListener("click", async () => { if (confirm("Put the MODX Performance back as it was before the last send?") && await MIDI.restore(0)) render(); });
     $("#scenebtn").onclick = () => openScenePlan({meter: $("#meter").value, bpm: num("#bpm"), current: scenePlan, onSave: plan => {
       scenePlan = plan; $("#planinfo").textContent = `Plan: ${plan.family}`; toast("Scene plan added — Save to keep it");
     }});
@@ -1236,6 +1469,7 @@ async function liveView(kind, id) {
         <div class="dots" id="dots"></div>
         <button class="btn" id="nsec" aria-label="Next section">▶</button>
         <button class="btn" id="nsong" aria-label="Next song">Song ⏭</button>
+        <button class="btn" id="afill" aria-pressed="false">Auto fill</button>
         <button class="btn" id="midi">MIDI</button><span class="midi" id="mst"></span>
         <button class="btn" id="fs" aria-label="Full screen">⛶</button>
         <button class="btn" id="exit">Exit</button>
@@ -1285,10 +1519,29 @@ async function liveView(kind, id) {
     return true;
   }
   // Scene buttons 1–8 over MIDI: one CC (MODX default 92); value bands of 16 select the scene.
+  const sceneMsg = n => send([0xB0 | ch(), (ms.sceneCC ?? 92) & 127, ((n - 1) * 16 + 8) & 127]);
+  // Arranger-style auto fill: moving between Verse/Pre-chorus/Chorus/Break plays a one-bar fill first
+  // (Fill A going up, Fill B going down), then the new section. The MODX switches arps on the bar line,
+  // so sending the next scene one bar after the fill always lands inside the fill bar.
+  let autoFill = (() => { try { return localStorage.getItem("sk_autofill") !== "0"; } catch { return true; } })();
+  let curScene = null, fillTimer = null;
+  const barMs = () => {
+    const c = songs[si].card, [a, b] = String(c.meter || "4/4").split("/").map(Number);
+    const bpm = +c.bpm || 100;
+    return (a || 4) * 4 / (b || 4) * 60000 / bpm;
+  };
   function sendScene() {
     if (ms.sendScenes === false || !midiOut) return;
     const x = secs()[xi]; if (!x?.scene) return;
-    send([0xB0 | ch(), (ms.sceneCC ?? 92) & 127, ((x.scene - 1) * 16 + 8) & 127]);
+    const to = +x.scene, from = curScene;
+    clearTimeout(fillTimer);
+    const mains = [2, 3, 4];
+    if (autoFill && songs[si].card.scene_plan && mains.includes(from) && [2, 3, 4, 7].includes(to) && to !== from) {
+      sceneMsg(to > from || to === 7 ? 5 : 6);
+      $("#zcur .scene")?.insertAdjacentHTML("afterend", ' <span class="scene fill">FILL</span>');
+      fillTimer = setTimeout(() => { sceneMsg(to); $$("#zcur .fill").forEach(e => e.remove()); }, barMs() + 40);
+    } else sceneMsg(to);
+    curScene = to;
   }
   function transposeNote(prevSong) {
     const t = +(songs[si].card.modx?.transpose || 0), prev = prevSong ? +(prevSong.card.modx?.transpose || 0) : 0;
@@ -1297,7 +1550,7 @@ async function liveView(kind, id) {
   }
   const goSong = d => {
     const n = si + d; if (n < 0 || n >= songs.length) return;
-    const prev = songs[si]; si = n; xi = 0; draw(); transposeNote(prev);
+    const prev = songs[si]; si = n; xi = 0; curScene = null; clearTimeout(fillTimer); draw(); transposeNote(prev);
     // Give the MODX a moment to load the sound before selecting its first scene.
     if (sendProgram()) setTimeout(sendScene, 400); else sendScene();
   };
@@ -1313,6 +1566,7 @@ async function liveView(kind, id) {
     const [st, cc, val] = e.data;
     if ((st & 0xF0) !== 0xB0 || (st & 15) !== ch() || cc !== (ms.sceneCC ?? 92)) return;
     const scene = Math.floor(val / 16) + 1, list = secs();
+    curScene = scene;
     if (list[xi]?.scene === scene) return;
     for (let k = 1; k <= list.length; k++) {
       const j = (xi + k) % list.length;
@@ -1320,6 +1574,9 @@ async function liveView(kind, id) {
     }
   }
 
+  const drawFill = () => { const b = $("#afill"); b.classList.toggle("primary", autoFill); b.setAttribute("aria-pressed", autoFill); b.textContent = autoFill ? "Auto fill on" : "Auto fill off"; };
+  $("#afill").onclick = () => { autoFill = !autoFill; try { localStorage.setItem("sk_autofill", autoFill ? "1" : "0"); } catch {} drawFill(); };
+  drawFill();
   $("#psong").onclick = () => goSong(-1); $("#nsong").onclick = () => goSong(1);
   $("#psec").onclick = () => goSec(-1); $("#nsec").onclick = () => goSec(1);
   $("#zcur").onclick = () => goSec(1); $("#znxt").onclick = () => goSec(1);
