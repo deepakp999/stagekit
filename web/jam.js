@@ -110,11 +110,12 @@ async function jamView() {
             ${plan.parts.map((x, i) => `<tr><td>${i + 2}</td><td><b>${esc(x.label)}</b></td>
               <td>${x.options?.length ? `<select class="jsnd" data-i="${i}">${x.options.map(o => `<option value="${o.no}" ${o.no === x.sound_no ? "selected" : ""}>${esc(o.name)}</option>`).join("")}
                 ${x.options.some(o => o.no === x.sound_no) ? "" : `<option value="${x.sound_no}" selected>${esc(x.sound_name || "")}</option>`}<option value="search">Search all…</option></select>` : esc(x.sound_name || "–")}</td>
-              <td class="small muted">${x.hold ? "holds the chord" : esc(x.from || plan.family || "")}</td></tr>`).join("")}
+              <td class="small muted">${x.hold ? "holds the chord" : hasPatterns(x) ? patternSelectHTML({...x, part: i + 2}, i) : esc(x.from || plan.family || "")}</td></tr>`).join("")}
             <tr><td>1</td><td><b>Your lead</b></td><td colspan="2">${(plan.leads || [plan.lead]).filter(Boolean).map(l => `<button class="btn sm jlead ${st.lead?.no === l.no ? "primary" : ""}" data-no="${l.no}" data-name="${esc(l.name)}">${esc(l.name)}</button>`).join(" ")}
               <button class="btn sm jlead ${!st.lead ? "primary" : ""}" data-no="">Keep mine</button></td></tr>
           </tbody></table>
           <div class="row" style="margin-top:10px">
+            ${plan.edm ? `<label class="chk" style="margin:0"><input type="checkbox" id="jguitar" ${plan.guitar ? "checked" : ""}> Guitar (instead of percussion)</label>` : ""}
             <label class="small">Split <select id="jsplit">${SPLIT_CHOICES.filter(n => n != null).map(n => `<option value="${n}" ${n === st.split ? "selected" : ""}>${noteName(n)}</option>`).join("")}</select></label>
             <span class="grow"></span><button class="btn primary" id="jsend">Send to MODX</button></div>
         </div>
@@ -150,6 +151,14 @@ async function jamView() {
       const set = (no, name) => { row.sound_no = no; row.sound_name = name; save(); drawPlan(); };
       if (sel.value === "search") return openFinder({meter: "4/4", bpm: plan.bpm, onUse: p => set(p.no, p.name), onArp: () => {}});
       set(+sel.value, sel.options[sel.selectedIndex].text);
+    });
+    bindPatternSelects($("#jplan"), plan.parts.map((x, i) => ({...x, part: i + 2})), "4/4", plan.bpm, (row, o) => {
+      const real = plan.parts.find(x => x.role === row.role);
+      Object.assign(real, {scenes: o.scenes, family: o.family, from: o.family, pattern_style: o.style}); save(); drawPlan();
+    }, sectionChords()[0] || "C");
+    $("#jguitar")?.addEventListener("change", async e => {
+      const fresh = await api("jam/shuffle", {method: "POST", json: {genre: plan.flavor, seed: plan.seed, guitar: e.target.checked}});
+      plan = {...fresh, progression: plan.progression, title: plan.title, notes: plan.notes}; save(); drawPlan();
     });
     $$(".jlead").forEach(b => b.onclick = () => { st.lead = b.dataset.no ? {no: +b.dataset.no, name: b.dataset.name} : null; drawPlan(); });
     $("#jsplit").onchange = e => { st.split = +e.target.value; };

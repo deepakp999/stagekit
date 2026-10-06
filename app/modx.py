@@ -387,7 +387,11 @@ def _pick_sound(pool, role, tone):
     return lst[i], why, opts
 
 
-def band_plan(family, flavor="unplugged", perc=True, tone=None, overrides=None):
+def pattern_family(cat, family):
+    return _pattern_families().get((cat, family))
+
+
+def band_plan(family, flavor="unplugged", perc=True, tone=None, overrides=None, patterns=None):
     style = STYLES.get(family)
     if not style:
         return None
@@ -410,9 +414,16 @@ def band_plan(family, flavor="unplugged", perc=True, tone=None, overrides=None):
                 if not b:
                     continue  # nothing suitable in this meter (e.g. no percussion grooves): leave the Part out
                 src, arps = b
+            pcat = {"gtr": "Gtr", "bass": "Bass"}.get(role)
+            chosen = (patterns or {}).get(role)
+            if pcat and chosen and pattern_family(pcat, chosen):     # your pattern choice for this song
+                src, arps = chosen, pattern_family(pcat, chosen)
             row["from"] = src if src != family else None
+            row["family"] = src
             row["scenes"] = [{"no": a["no"], "name": a["name"], "var": a["var"]} if a else None for a in _scene_arps(arps)]
             row["sound"] = next((a.get("sound") for a in arps if a.get("sound")), None)
+            if pcat:
+                row["pattern_style"] = pattern_style(pcat, src, arps)[1]
         no, why, opts = _pick_sound(pools.get(role, []), role, tone)
         if not no and not row["hold"]:
             p = resolve_sound({"drums": "Dr/Pc", "bass": "Bass", "gtr": "Gtr", "keys": "Piano", "perc": "Dr/Pc"}.get(role, role), row.get("sound"))
@@ -443,3 +454,78 @@ BAND_FX = {
     "retro": {"reverb": [0x01, 0x20], "reverb_name": "R3 Plate", "variation": [0x02, 0x20], "variation_name": "Tempo Delay Mono", "lead_var": 24},
     "indian": {"reverb": [0x01, 0x03], "reverb_name": "HD Hall", "variation": [0x02, 0x28], "variation_name": "Tempo Delay Stereo", "lead_var": 28},
 }
+
+
+# ---------- guitar strums and bass lines: pick the pattern style per Part ----------
+# The MODX names patterns by groove ("MA_FingerPickin", "MB_Reggaeton1 Mute Gtr"), not by technique, so
+# the style comes from name hints, the sound the pattern was written for and the groove family.
+GTR_STYLES = [
+    ("strum", "Strum (acoustic)", re.compile(r"strum|folk|country|cntry|unplug|8beat|8bt|8 beat|acoustic|steel|mega steel|campfire|worship|wrshp", re.I)),
+    ("muted", "Muted / chop", re.compile(r"mute|chop|reggae|ska|skank|cutting|dancehall|reggaeton", re.I)),
+    ("funk", "Funk / R&B", re.compile(r"funk|disco|wah|r&b|motown|soul|philly|slow&easy", re.I)),
+    ("finger", "Fingerpick / arpeggio", re.compile(r"finger|pickin|nylon|classical|bossa|jazz|harp|arpeg|ballad|bld|12str|steel ?guitar|ambient|chill|delay", re.I)),
+    ("rock", "Rock / power", re.compile(r"rock|punk|metal|grunge|power|od/dist|dist|drive|hard", re.I)),
+    ("clean", "Clean / pop", re.compile(r".", re.I)),
+]
+BASS_STYLES = [
+    ("walking", "Walking / jazz", re.compile(r"walk|jazz|swing|bebop|blues", re.I)),
+    ("slap", "Slap / funk", re.compile(r"slap|funk|disco|yay area|motown", re.I)),
+    ("synth", "Synth / sub", re.compile(r"synth|sub|808|trap|wobble|edm|house|techno|dirty|trance|dub|electro|step", re.I)),
+    ("reggae", "Reggae / Latin", re.compile(r"reggae|latin|salsa|bossa|afro|reggaeton|samba|cumbia|merengue|montuno", re.I)),
+    ("picked", "Picked / rock", re.compile(r"pick|rock|punk|metal|grunge", re.I)),
+    ("octave", "Octave / disco", re.compile(r"octave|oct\b|disco|dance", re.I)),
+    ("root", "Root & fifth / ballad", re.compile(r".", re.I)),   # everything else
+]
+_PATTERN_FAMS = None
+
+
+def _pattern_families():
+    """{(cat, family): [arps]} for every prefixed Gtr / Bass pattern."""
+    global _PATTERN_FAMS
+    if _PATTERN_FAMS is None:
+        fam = {}
+        for a in ARPS:
+            if a["cat"] not in ("Gtr", "Bass"):
+                continue
+            m = _NAME_RX.match(a["name"])
+            if not m:
+                continue
+            fam.setdefault((a["cat"], m.group(4).strip()), []).append({**a, "var": m.group(2), "n": m.group(3) or ""})
+        _PATTERN_FAMS = fam
+    return _PATTERN_FAMS
+
+
+def pattern_style(cat, family, arps):
+    sound = next((a.get("sound") for a in arps if a.get("sound")), "") or ""
+    text = family + " " + sound
+    for sid, label, rx in (GTR_STYLES if cat == "Gtr" else BASS_STYLES):
+        if rx.search(text):
+            return sid, label
+    return ("clean", "Clean / pop") if cat == "Gtr" else ("root", "Root & fifth / ballad")
+
+
+def pattern_options(role, ts="4/4", bpm=None, per_style=8):
+    """Pattern choices for a guitar or bass Part, grouped by style, nearest tempo first."""
+    cat = "Gtr" if role in ("gtr", "gtr2", "Gtr") else "Bass"
+    styles = GTR_STYLES if cat == "Gtr" else BASS_STYLES
+    groups = {sid: {"id": sid, "label": label, "options": []} for sid, label, _ in styles}
+    for (c, family), arps in _pattern_families().items():
+        if c != cat or arps[0].get("ts") != ts:
+            continue
+        if not any(a["var"] in ("MA", "MB", "MC", "MD") for a in arps):
+            continue
+        sid, _ = pattern_style(cat, family, arps)
+        tempo = arps[0].get("tempo") or 120
+        dist = abs(tempo - bpm) if bpm else 0
+        groups[sid]["options"].append({"family": family, "tempo": tempo, "sound": arps[0].get("sound"),
+                                       "variations": len({a["var"] for a in arps}), "dist": dist,
+                                       "scenes": [{"no": a["no"], "name": a["name"], "var": a["var"]} if a else None
+                                                  for a in _scene_arps(arps)]})
+    out = []
+    for sid, _, _ in styles:
+        g = groups[sid]
+        g["options"].sort(key=lambda o: (o["dist"] > 25, -min(o["variations"], 6), o["dist"]))
+        g["options"] = g["options"][:per_style]
+        if g["options"]:
+            out.append(g)
+    return {"role": role, "cat": cat, "ts": ts, "groups": out}

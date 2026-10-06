@@ -202,7 +202,8 @@ def _plan_for(family, band, card=None):
         card = card or {}
         tone = (card.get("auto_cache") or {}).get("tone")
         overrides = (card.get("sound_overrides") or {}).get(band)
-        return modx.band_plan(family, band, tone=tone, overrides=overrides)
+        patterns = (card.get("pattern_overrides") or {}).get(band)
+        return modx.band_plan(family, band, tone=tone, overrides=overrides, patterns=patterns)
     return modx.scene_plan(family)
 
 
@@ -248,11 +249,24 @@ def song_autobuild(sid: str, body: AutoBody):
 
 @app.get("/api/songs/{sid}/chords", dependencies=[Depends(auth)])
 def chords(sid: str):
-    p = os.path.join(db.song_dir(sid), "chords.json")
+    d = db.song_dir(sid)
+    p = os.path.join(d, "chords.json")
     if not os.path.exists(p):
         raise HTTPException(404, "No chords yet")
     with open(p) as f:
-        return json.load(f)
+        chords = json.load(f)
+    bass = os.path.join(d, "stems", "bass.wav")
+    flag = os.path.join(d, "chords.bass")
+    if os.path.exists(bass) and not os.path.exists(flag):   # songs made before slash-chord detection
+        try:
+            from .analysis import add_slash_bass
+            chords = add_slash_bass(chords, bass)
+            with open(p, "w") as f:
+                json.dump(chords, f)
+        except Exception:
+            pass
+        open(flag, "w").close()
+    return chords
 
 
 class LyricsFetch(BaseModel):
@@ -484,12 +498,19 @@ def modx_styles(q: str = "", meter: str = "", bpm: Optional[float] = None):
     return modx.list_styles(q, meter, bpm)
 
 
+@app.get("/api/modx/patterns", dependencies=[Depends(auth)])
+def modx_patterns(role: str = "gtr", ts: str = "4/4", bpm: Optional[float] = None):
+    """Guitar strum / bass line choices for a Part, grouped by style, nearest tempo first."""
+    return modx.pattern_options(role, ts, bpm)
+
+
 # ---------- jam: shuffle / describe ----------
 
 class JamBody(BaseModel):
     genre: str = ""
     seed: Optional[int] = None
     text: str = ""
+    guitar: Optional[bool] = None
 
 
 @app.get("/api/jam/genres", dependencies=[Depends(auth)])
@@ -499,7 +520,7 @@ def jam_genres():
 
 @app.post("/api/jam/shuffle", dependencies=[Depends(auth)])
 def jam_shuffle(body: JamBody):
-    return _plain(jam.shuffle(body.genre or None, body.seed))
+    return _plain(jam.shuffle(body.genre or None, body.seed, body.guitar))
 
 
 @app.post("/api/jam/describe", dependencies=[Depends(auth)])

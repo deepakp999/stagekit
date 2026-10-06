@@ -64,6 +64,15 @@ BAND_SCENES = ["Intro", "Verse", "Pre-chorus", "Chorus", "Fill A", "Fill B", "Br
 
 ROLE_CATS = {"drums": ["Dr/Pc"], "perc": ["Dr/Pc", "CPerc"], "bass": ["Bass"], "gtr": ["SynCp", "Gtr"],
              "keys": ["Keys", "Piano", "SynCp"]}
+# Guitar for electronic genres (replaces the percussion Part): preferred strum/pattern style and sounds.
+GENRE_GUITAR = {
+    "tropical": ("muted", [2529, 1665]), "reggaeton": ("muted", [2529, 1665]), "chill": ("finger", [2529, 333]),
+    "house": ("funk", [332, 331]), "disco": ("funk", [332, 334]), "hiphop": ("clean", [333, 2529]),
+    "futurebass": ("clean", [333]), "edm": ("strum", [317, 323]), "trance": ("finger", [333, 316]),
+    "trap": ("finger", [2529, 333]), "techno": ("muted", [332]), "dnb": ("clean", [333]), "dubstep": ("rock", [2532]),
+}
+GUITAR_DEFAULT_ON = {"tropical", "reggaeton", "chill", "house", "disco", "hiphop"}
+
 ROLE_LABELS = {"drums": "Drums", "perc": "Percussion", "bass": "Bass", "gtr": "Pluck / stab", "keys": "Chords",
                "strings": "Wide synth", "pad": "Pad"}
 
@@ -107,14 +116,40 @@ def _candidates(genre, role, bpm):
     return out
 
 
-def electronic_plan(genre, bpm=None, rng=None, sounds=None):
+def _genre_guitar(genre, bpm, rng):
+    style, pool = GENRE_GUITAR.get(genre, ("clean", [333]))
+    opts = modx.pattern_options("gtr", "4/4", bpm)
+    group = next((g for g in opts["groups"] if g["id"] == style), None) or (opts["groups"][0] if opts["groups"] else None)
+    if not group or not group["options"]:
+        return None
+    rx = re.compile(ELECTRONIC[genre]["match"], re.I) if genre in ELECTRONIC else None
+    own = [o for g in opts["groups"] for o in g["options"] if rx and rx.search(o["family"])]
+    pick_from = own or group["options"][:4]
+    o = (rng.choice(pick_from) if rng else pick_from[0])
+    if own:
+        group = next(g for g in opts["groups"] if o in g["options"])
+    no = rng.choice(pool) if rng else pool[0]
+    p = modx._PERF_BY_NO.get(no)
+    return {"role": "gtr2", "label": "Guitar", "cat": "gtr2", "hold": False, "from": o["family"], "family": o["family"],
+            "pattern_style": group["label"], "scenes": o["scenes"], "sound_no": p["no"] if p else None,
+            "sound_name": p["name"] if p else None, "why": "",
+            "options": [{"no": n, "name": modx._PERF_BY_NO[n]["name"]} for n in [2529, 1665, 316, 317, 333, 331, 332, 334] if n in modx._PERF_BY_NO]}
+
+
+def electronic_plan(genre, bpm=None, rng=None, sounds=None, guitar=None):
     g = ELECTRONIC[genre]
     bpm = bpm or g["bpm"]
     rng = rng or random.Random()
     sounds = sounds or {}
     parts = []
     used = set()
+    guitar = genre in GUITAR_DEFAULT_ON if guitar is None else guitar
     for role in ("drums", "perc", "bass", "gtr", "keys", "strings", "pad"):
+        if role == "perc" and guitar:
+            g_row = _genre_guitar(genre, bpm, rng)
+            if g_row:
+                parts.append(g_row)
+                continue
         row = {"role": role, "label": ROLE_LABELS[role], "cat": role, "scenes": [None] * 8, "hold": role in ("strings", "pad"), "from": None}
         if not row["hold"]:
             cands = [c for c in _candidates(genre, role, bpm) if c[0] not in used]
@@ -126,6 +161,9 @@ def electronic_plan(genre, bpm=None, rng=None, sounds=None):
             family, arps, _, _ = rng.choice(top) if rng else top[0]
             used.add(family)
             row["from"] = family
+            row["family"] = family
+            if role == "bass":
+                row["pattern_style"] = modx.pattern_style("Bass", family, arps)[1]
             row["scenes"] = [{"no": a["no"], "name": a["name"], "var": a["var"]} if a else None for a in modx._scene_arps(arps)]
         pool = g["pools"].get(role, [])
         choice = sounds.get(role)
@@ -138,7 +176,7 @@ def electronic_plan(genre, bpm=None, rng=None, sounds=None):
     fx = {"reverb": [0x01, 0x21], "reverb_name": "HD Plate", "variation": [0x02, 0x28], "variation_name": "Tempo Delay Stereo", "lead_var": 30}
     if genre in ("chill", "hiphop", "trap"):
         fx = {**fx, "reverb": [0x01, 0x13], "reverb_name": "HD Room", "lead_var": 22}
-    return {"family": g["label"], "ts": "4/4", "tempo": bpm, "flavor": genre, "flavor_label": g["label"], "band": True,
+    return {"family": g["label"], "ts": "4/4", "tempo": bpm, "flavor": genre, "flavor_label": g["label"], "band": True, "guitar": guitar,
             "edm": True, "scenes": EDM_SCENES, "parts": parts, "lead": leads[0] if leads else None, "leads": leads, "fx": fx}
 
 
@@ -198,11 +236,11 @@ def all_genres():
     return g
 
 
-def build(genre, bpm=None, key=None, seed=None, sounds=None, prog_style=None, randomize=True):
+def build(genre, bpm=None, key=None, seed=None, sounds=None, prog_style=None, randomize=True, guitar=None):
     rng = random.Random(seed) if randomize else None
     prng = random.Random(seed)
     if genre in ELECTRONIC:
-        plan = electronic_plan(genre, bpm, rng, sounds)
+        plan = electronic_plan(genre, bpm, rng, sounds, guitar)
         style = prog_style or ELECTRONIC[genre]["prog"]
     else:
         fams = [f for f, s in modx.STYLES.items() if s["ts"] == "4/4"]
@@ -220,13 +258,13 @@ def build(genre, bpm=None, key=None, seed=None, sounds=None, prog_style=None, ra
     return plan
 
 
-def shuffle(genre=None, seed=None):
+def shuffle(genre=None, seed=None, guitar=None):
     seed = seed if seed is not None else random.randrange(1 << 30)
     rng = random.Random(seed)
     if not genre or genre == "any":
         genre = rng.choice(list(ELECTRONIC) + list(modx.BAND_POOLS))
     g = ELECTRONIC.get(genre)
     bpm = round((g["bpm"] if g else rng.choice([76, 84, 92, 100, 110, 120])) * rng.uniform(0.96, 1.04))
-    plan = build(genre, bpm=bpm, seed=seed)
+    plan = build(genre, bpm=bpm, seed=seed, guitar=guitar)
     plan["seed"] = seed
     return plan

@@ -194,3 +194,4 @@ dialog.finder .chk input[type=number]{display:inline-block;width:64px;padding:4p
 .jsc.on{background:var(--accent2);color:#04201d;border-color:var(--accent2)}.jsc.pending{outline:2px solid var(--accent)}
 .jsc .small{opacity:.75;font-family:ui-monospace,monospace}
 @media(max-width:700px){.jscenes{grid-template-columns:repeat(2,1fr)}}
+.patsel{max-width:220px;font-size:12px;padding:3px 6px}

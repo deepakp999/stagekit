@@ -456,6 +456,7 @@ const SCENE_MIX = {
   // Arranger band (Intro, Verse=Main A, Pre-chorus=Main B, Chorus=Main C, Fill A, Fill B, Break, Ending)
   perc:    {mute: [0, 1, 6, 7], vol: [90, 90, 92, 105, 105, 105, 90, 90]},
   gtr:     {mute: [], vol: [100, 95, 100, 106, 104, 104, 100, 100]},
+  gtr2:    {mute: [], vol: [100, 95, 100, 106, 104, 104, 100, 100]},
   keys:    {mute: [], vol: [100, 92, 95, 100, 100, 100, 105, 100]},
   strings: {mute: [1], vol: [85, 85, 88, 108, 100, 100, 105, 100]},
   pad:     {mute: [], vol: [95, 85, 85, 82, 82, 82, 100, 95]},
@@ -470,6 +471,7 @@ const SCENE_MIX_EDM = {
   perc:    {mute: [0, 6, 7], vol: [90, 95, 100, 108, 105, 105, 90, 90]},
   bass:    {mute: [0, 2, 6], vol: [100, 105, 100, 115, 110, 110, 100, 100]},
   gtr:     {mute: [0], vol: [95, 100, 104, 108, 104, 104, 100, 95]},
+  gtr2:    {mute: [0, 6], vol: [92, 98, 100, 104, 102, 102, 95, 92]},
   keys:    {mute: [], vol: [92, 95, 100, 104, 100, 100, 105, 95]},
   strings: {mute: [0, 1], vol: [90, 90, 98, 110, 105, 105, 108, 100]},
   pad:     {mute: [], vol: [100, 88, 92, 85, 85, 85, 105, 100]},
@@ -543,7 +545,7 @@ const SCENE_INTENSITY_EDM = [0.3, 0.55, 0.4, 1.0, 0.9, 0.9, 0.35, 0.4];  // buil
 const SUPER_KNOB_SCENES_EDM = [150, 420, 200, 980, 900, 900, 180, 260];
 const ARP_VEL = [85, 88, 95, 108, 110, 110, 80, 100];                    // % per scene
 const ARP_GATE = [100, 85, 95, 100, 100, 100, 105, 110];
-const REV_SEND = {drums: 18, perc: 22, bass: 4, gtr: 30, keys: 34, strings: 48, pad: 55, comp: 30, comp2: 30};
+const REV_SEND = {drums: 18, perc: 22, bass: 4, gtr: 30, gtr2: 28, keys: 34, strings: 48, pad: 55, comp: 30, comp2: 30};
 const SCENE_REV_RETURN = [80, 64, 66, 70, 70, 70, 85, 85];
 const WIND_RX = /flute|shehnai|whistle|sax|clari|ney|zurna|pungi|violin|cello|harmonica|lead|oboe|trumpet/i;
 const LAYER_TEXT = {
@@ -574,7 +576,7 @@ function layerMessages(plan, opts) {
   }
   if (opts.motion !== false) C(0x00, 0x01, 0x0A, [1]);         // Motion Seq master on
   band.forEach((row, k) => {
-    const p = row.part - 1, role = row.role || "comp", melodic = ["gtr", "keys", "strings", "pad", "comp", "comp2"].includes(role);
+    const p = row.part - 1, role = row.role || "comp", melodic = ["gtr", "gtr2", "keys", "strings", "pad", "comp", "comp2"].includes(role);
     for (let c = 0; c < 8; c++) {
       if (opts.expression !== false) {
         const bright = melodic ? Math.round(((plan.edm ? SCENE_INTENSITY_EDM : SCENE_INTENSITY)[c] - 0.65) * 36) : 0;
@@ -724,6 +726,52 @@ const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", 
 const noteName = n => `${NOTE_NAMES[n % 12]}${Math.floor(n / 12) - 2}`;   // Yamaha: C3 = 60
 const SPLIT_CHOICES = [null, 48, 53, 54, 55, 60];
 
+
+// ---------- guitar strum / bass line pattern picker (Auto-build and Jam) ----------
+const PATTERN_CACHE = {};
+async function loadPatterns(role, ts, bpm) {
+  const k = `${role}|${ts}|${Math.round(bpm || 0)}`;
+  if (!PATTERN_CACHE[k]) PATTERN_CACHE[k] = api(`modx/patterns?role=${role === "bass" ? "bass" : "gtr"}&ts=${encodeURIComponent(ts || "4/4")}${bpm ? `&bpm=${bpm}` : ""}`);
+  return PATTERN_CACHE[k];
+}
+const hasPatterns = row => ["gtr", "gtr2", "bass"].includes(row.role) && !(row.label || "").match(/pluck|synth comp|santoor/i);
+function patternSelectHTML(row, i) {
+  if (!hasPatterns(row)) return "";
+  return `<div class="row" style="gap:4px;margin-top:4px;flex-wrap:nowrap"><select class="patsel" data-i="${i}" aria-label="${esc(row.label)} pattern" title="${row.role === "bass" ? "Bass line style" : "Guitar strum / pattern style"}">
+      <option value="">${esc(row.pattern_style ? row.pattern_style + " · " : "")}${esc(row.family || row.from || "groove pattern")}</option></select>
+    <button class="btn sm patplay" data-i="${i}" title="Try this pattern on the MODX (after sending)">▶</button></div>`;
+}
+// Fills a pattern <select> on first use; onPick(row, option) gets {family, scenes, style}.
+function bindPatternSelects(root, rows, ts, bpm, onPick, chord) {
+  $$(".patsel", root).forEach(sel => {
+    const row = rows[+sel.dataset.i];
+    let opts = null;
+    const fill = async () => {
+      if (opts) return;
+      const r = await loadPatterns(row.role, ts, bpm);
+      opts = {};
+      sel.innerHTML = `<option value="">${esc(row.pattern_style ? row.pattern_style + " · " : "")}${esc(row.family || row.from || "groove pattern")}</option>` +
+        r.groups.map(g => `<optgroup label="${esc(g.label)}">${g.options.map(o => { opts[g.id + "|" + o.family] = {...o, style: g.label};
+          return `<option value="${esc(g.id + "|" + o.family)}">${esc(o.family)} · ${o.tempo} BPM${o.sound ? " · " + esc(o.sound) : ""}</option>`; }).join("")}</optgroup>`).join("");
+    };
+    sel.addEventListener("focus", fill); sel.addEventListener("mousedown", fill); sel.addEventListener("touchstart", fill, {passive: true});
+    sel.onchange = () => { const o = opts?.[sel.value]; if (o) onPick(row, o); };
+  });
+  $$(".patplay", root).forEach(b => b.onclick = () => previewPattern(rows[+b.dataset.i], bpm, chord));
+}
+// Writes this Part's 8 arps to the MODX and plays a chord for two bars so you can hear the pattern in context.
+async function previewPattern(row, bpm, chord) {
+  if (!row.part) return toast("Pick a band layout first");
+  const out = await MIDI.ensure(); if (!out) return;
+  const p = row.part - 1, ch = ((midiSettings().channel || 1) - 1) & 15;
+  row.scenes.forEach((x, i) => { const no = x?.no ?? x; if (no) out.send(ymh([0x10 + p, 0x00, 0x06, 0x44 + 2 * i], d14(no))); });
+  out.send(ymh([0x10 + p, 0x00, 0x01, 0x47], [1]));
+  const notes = typeof chordNotes === "function" ? chordNotes(chord || "C", 54) : [48, 52, 55];
+  notes.forEach(n => out.send([0x90 | ch, n, 96]));
+  toast(`Playing ${row.family || "pattern"} on Part ${row.part} — press STORE only if you keep it`, 3500);
+  setTimeout(() => notes.forEach(n => out.send([0x80 | ch, n, 0])), 2 * 4 * 60000 / (bpm || 100));
+}
+
 // ---------------- Auto-build ----------------
 
 const BAND_MOODS = [["unplugged", "Unplugged"], ["band", "Full band"], ["devotional", "Devotional"], ["cinematic", "Cinematic"], ["remix", "Remix / dance"], ["retro", "Retro film"], ["indian", "Indian"], ["", "Groove only"]];
@@ -764,7 +812,7 @@ async function openAutoBuild({sid, meter, bpm, onApply}) {
     draw();
   };
   const toPlan = p => ({family: p.family, ts: p.ts, tempo: p.tempo, band: !!p.band, flavor: p.flavor, lead: p.lead, leads: p.leads || [], fx: p.fx, tone: p.tone,
-    parts: p.parts.map((x, i) => ({options: x.options || [], why: x.why || "",
+    parts: p.parts.map((x, i) => ({options: x.options || [], why: x.why || "", family: x.family, pattern_style: x.pattern_style,
     cat: x.cat, role: x.role, hold: !!x.hold, from: x.from, label: x.label, sound: x.sound, sound_no: x.sound_no, sound_name: x.sound_name,
     names: x.scenes.map(y => y && y.name), scenes: x.scenes.map(y => y && y.no), part: i < (p.band ? 7 : 4) ? i + 2 : 0}))});
   const applyTabla = p => {
@@ -777,6 +825,7 @@ async function openAutoBuild({sid, meter, bpm, onApply}) {
       scenes: x.scenes.map((_, i) => first + i), names: x.scenes.map((_, i) => `User ${st.tabla.first + i}`)})};
   };
 
+  const finalPlanRows = () => dlg._final?.plan?.parts || [];
   function draw() {
     const g = r.groove;
     const finalPlan = applyTabla(plan);
@@ -819,7 +868,7 @@ async function openAutoBuild({sid, meter, bpm, onApply}) {
         <div>
           <h3>Plan</h3>
           ${finalPlan ? `<div class="ptable"><table class="sec plan"><thead><tr><th>Part</th><th>Instrument</th><th>Sound</th>${["Intro", "Main A", "Main B", "Main C", "Fill A", "Fill B", "Break", "Ending"].map((n, i) => `<th>S${i + 1}<br><span class="muted">${n}</span></th>`).join("")}</tr></thead><tbody>
-            ${finalPlan.parts.filter(x => x.part).map(x => `<tr><td>${x.part}</td><td><b>${esc(x.label)}</b>${x.from ? `<br><span class="small muted">from ${esc(x.from)}</span>` : ""}</td><td class="small">${x.options?.length ? `<select class="sndsel" data-role="${esc(x.role || "")}" aria-label="${esc(x.label)} sound">
+            ${finalPlan.parts.filter(x => x.part).map(x => `<tr><td>${x.part}</td><td><b>${esc(x.label)}</b>${x.from && !hasPatterns(x) ? `<br><span class="small muted">from ${esc(x.from)}</span>` : ""}${patternSelectHTML(x, finalPlan.parts.indexOf(x))}</td><td class="small">${x.options?.length ? `<select class="sndsel" data-role="${esc(x.role || "")}" aria-label="${esc(x.label)} sound">
               ${x.options.map(o => `<option value="${o.no}" ${o.no === x.sound_no ? "selected" : ""}>${esc(o.name)}</option>`).join("")}
               ${x.options.some(o => o.no === x.sound_no) ? "" : `<option value="${x.sound_no}" selected>${esc(x.sound_name || "")}</option>`}
               <option value="search">Search all sounds…</option></select>${x.why ? `<div class="muted" style="font-size:11px">${esc(x.why)}</div>` : ""}` : esc(x.sound_name || "–")}</td>${x.hold ? `<td colspan="8" class="small muted">holds the chord you play · ${SCENE_MIX[x.role]?.mute.length ? "out in " + SCENE_MIX[x.role].mute.map(i => ["Intro", "Verse", "Pre", "Chorus", "Fill A", "Fill B", "Break", "Ending"][i]).join(", ") : "every scene"}</td>` : x.scenes.map(n => `<td class="an">${n || "–"}</td>`).join("")}</tr>`).join("")}
@@ -847,6 +896,15 @@ async function openAutoBuild({sid, meter, bpm, onApply}) {
     });
     $("#asplit", dlg).onchange = e => { st.split = e.target.value === "" ? null : +e.target.value; savePrefs(); draw(); };
     $("#aleadpick", dlg).onclick = () => openFinder({meter, bpm, onUse: p => { st.lead = {no: p.no, name: p.name, v2: true}; savePrefs(); draw(); }, onArp: () => {}});
+    bindPatternSelects(dlg, finalPlanRows(), meter, bpm || r.bpm, async (row, o) => {
+      const real = plan.parts.find(x => x.role === row.role) || row;
+      Object.assign(real, {scenes: o.scenes.map(y => y && y.no), names: o.scenes.map(y => y && y.name), family: o.family, from: o.family, pattern_style: o.style});
+      try {   // remember per song and mood
+        const cur = (await api(`songs/${sid}`)).card.pattern_overrides || {};
+        await api(`songs/${sid}`, {method: "PATCH", json: {card: {pattern_overrides: {...cur, [st.band]: {...(cur[st.band] || {}), [row.role]: o.family}}}}});
+      } catch {}
+      draw();
+    }, (r.sections?.[0]?.chords || "").split(/\s+/)[0] || "C");
     $$(".leadopt", dlg).forEach(b => b.onclick = () => { st.lead = {no: +b.dataset.no, name: b.dataset.name, v2: true}; savePrefs(); draw(); });
     $$(".sndsel", dlg).forEach(sel => sel.onchange = () => {
       const row = plan.parts.find(x => x.role === sel.dataset.role); if (!row) return;

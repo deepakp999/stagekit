@@ -1,4 +1,6 @@
 """Key and tempo estimates. These are suggestions; the song card always lets the player override them."""
+import re
+
 import numpy as np
 
 # Krumhansl-Schmuckler key profiles
@@ -130,3 +132,42 @@ def analyse(path, drums_path=None):
         "bpm": bpm,
         "bpm_alternatives": balts,
     }
+
+
+def add_slash_bass(chords, bass_path):
+    """Mark bass movement from the bass stem: a chord whose bass note isn't its root becomes a slash
+    chord ("C" over B -> "C/B"), when the bass is clear and the note is a chord tone or a common
+    passing note. Returns a new list; chords without a clear bass stay as they are."""
+    import librosa
+
+    sr, hop = 11025, 256
+    y, _ = librosa.load(bass_path, sr=sr, mono=True, duration=900)
+    if len(y) < sr:
+        return chords
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop, fmin=librosa.note_to_hz("C1"), n_octaves=3, bins_per_octave=36)
+    rms = librosa.feature.rms(y=y, hop_length=hop)[0]
+    times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sr, hop_length=hop)
+    loud = np.percentile(rms, 60) * 0.5
+    out = []
+    for seg in chords:
+        name = seg["c"]
+        m = re.match(r"^([A-G]#?)(m?)$", name)
+        if not m:
+            out.append(seg)
+            continue
+        sel = (times >= seg["t"]) & (times < seg["t"] + seg["d"])
+        sel &= rms[: len(times)] > loud
+        if sel.sum() < 4:
+            out.append(seg)
+            continue
+        prof = np.median(chroma[:, sel], axis=1)
+        pc = int(np.argmax(prof))
+        strength = prof[pc] / (prof.sum() + 1e-9)
+        root = _SHARP.index(m.group(1))
+        iv = (pc - root) % 12
+        allowed = {3, 7, 10, 11, 2, 9} | ({4} if not m.group(2) else set())
+        if strength > 0.22 and iv != 0 and iv in allowed:
+            out.append({**seg, "c": f"{name}/{_SHARP[pc]}"})
+        else:
+            out.append(seg)
+    return out

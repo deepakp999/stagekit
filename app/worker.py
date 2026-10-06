@@ -15,7 +15,7 @@ import traceback
 from . import db
 import json
 
-from .analysis import analyse, detect_chords
+from .analysis import add_slash_bass, analyse, detect_chords
 
 log = logging.getLogger("stagekit.worker")
 
@@ -212,8 +212,16 @@ def run_job(sid):
             src_c = os.path.join(stem_dir, "instrumental.wav") if stem_dir else wav
             if not os.path.exists(src_c):
                 src_c = wav
+            chords = detect_chords(src_c)
+            bass_wav = os.path.join(stem_dir, "bass.wav") if stem_dir else None
+            if bass_wav and os.path.exists(bass_wav):
+                try:  # bass movement -> slash chords (C/B, Am/G)
+                    chords = add_slash_bass(chords, bass_wav)
+                    open(os.path.join(d, "chords.bass"), "w").close()
+                except Exception as e:
+                    log.error("slash bass failed for %s: %s", sid, e)
             with open(os.path.join(d, "chords.json"), "w") as f:
-                json.dump(detect_chords(src_c), f)
+                json.dump(chords, f)
         except Exception as e:
             log.error("chords failed for %s: %s", sid, e)
 
