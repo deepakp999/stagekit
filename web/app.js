@@ -406,11 +406,18 @@ async function sendPlanToModx(plan, bpm, opts = {}) {
       // wrong Part. Switch it off for Parts 1–8 and give each its own channel (Tx/Rx Channel = Part number) first.
       for (let p = 0; p < 8; p++) { kc(p, false); out.send(ymh([0x10 + p, 0x00, 0x08, 0x02], [0, p])); }
       await wait(200);
+      const rx = (p, ch) => out.send(ymh([0x10 + p, 0x00, 0x08, 0x02], [0, ch]));   // MIDI Tx/Rx Channel (0x7F = off)
       for (const [i, l] of loads.entries()) {
         toast(`Loading sound ${i + 1} of ${loads.length} into Part ${l.part}…`, 3000);
-        presetMsgs(l.no, l.part - 1, 63).forEach(m => out.send(m));   // Single Part bank select (MSB 63)
+        const p = l.part - 1;
+        // Channel 1 is the keyboard channel and the MODX ignores single-Part loads there,
+        // so Part 1 borrows channel 16 (Part 16 stops listening for a moment).
+        const ch = p === 0 ? 15 : p;
+        if (p === 0) { rx(15, 0x7F); rx(0, 15); await wait(100); }
+        presetMsgs(l.no, ch, 63).forEach(m => out.send(m));   // Single Part bank select (MSB 63)
         await wait(1000);
-        kc(l.part - 1, false);  // the loaded preset may switch it back on; keep it off until everything is loaded
+        kc(p, false);  // the loaded preset may switch it back on; keep it off until everything is loaded
+        if (p === 0) { rx(0, 0); rx(15, 15); await wait(50); }
       }
       await wait(300);
     }
@@ -441,7 +448,8 @@ async function verifyPlan(plan, opts) {
       arps.push(d ? (d[0] << 7) | d[1] : null);
     }
     rows.push({part: r.part, label: r.label, want: r.sound_name, name: name == null ? null : name.trim(),
-      arpsOk: arps.every((n, i) => n === (r.scenes[i] || 0)), arps, wantArps: r.scenes});
+      arpsOk: arps.every((n, i) => n === (r.scenes[i] || 0)), arps, wantArps: r.scenes,
+      soundOk: name == null || !r.sound_name || name.toLowerCase().includes(r.sound_name.toLowerCase().slice(0, 6))});
   }
   return rows;
 }
@@ -452,7 +460,7 @@ function showSendReport(rows) {
   dlg.innerHTML = `<b>Sent to the MODX</b>
     ${answered ? `<table class="sec" style="margin-top:8px"><thead><tr><th>Part</th><th>Should be</th><th>MODX has</th><th>Arps</th></tr></thead><tbody>
       ${rows.map(r => `<tr><td>${r.part}</td><td><b>${esc(r.label)}</b><br><span class="small muted">${esc(r.want || "")}</span></td>
-        <td class="small">${esc(r.name ?? "?")}</td><td>${r.arpsOk ? "✓" : `<span style="color:var(--danger)">✗</span><br><span class="small muted">${r.arps.map(n => n ?? "?").join(" ")}</span>`}</td></tr>`).join("")}
+        <td class="small" ${r.soundOk ? "" : 'style="color:var(--danger)"'}>${esc(r.name ?? "?")}</td><td>${r.arpsOk ? "✓" : `<span style="color:var(--danger)">✗</span><br><span class="small muted">${r.arps.map(n => n ?? "?").join(" ")}</span>`}</td></tr>`).join("")}
       </tbody></table>
       ${rows.every(r => r.arpsOk) ? "" : `<div class="small" style="color:var(--danger);margin-top:6px">Some arps didn't stick. Check Utility → Settings → MIDI: Device Number = All (or 1), and send again.</div>`}`
     : `<div class="small muted" style="margin-top:8px">The MODX didn't answer the check (it only answers when its MIDI Device Number is All or 1). The settings were still sent.</div>`}
@@ -474,7 +482,7 @@ const AUTO_FEELS = [["", "Auto"], ["pop", "Pop / rock"], ["ballad", "Ballad"], [
 
 async function openAutoBuild({sid, meter, bpm, onApply}) {
   const prefs = (() => { try { return JSON.parse(localStorage.getItem("sk_auto") || "{}"); } catch { return {}; } })();
-  const st = {feel: prefs.feel || "", split: prefs.split === undefined ? 54 : prefs.split, lead: prefs.lead || {no: 3, name: "CFX Concert"},
+  const st = {feel: prefs.feel || "", split: prefs.split === undefined ? 54 : prefs.split, lead: prefs.lead?.keep || prefs.lead?.v2 ? prefs.lead : {keep: true, v2: true},
     tabla: prefs.tabla || {use: false, first: 1, kit: 2813}, othersOff: prefs.othersOff !== false, useSections: true};
   const savePrefs = () => { try { localStorage.setItem("sk_auto", JSON.stringify({feel: st.feel, split: st.split, lead: st.lead, tabla: st.tabla, othersOff: st.othersOff})); } catch {} };
   const dlg = document.createElement("dialog"); dlg.className = "mdlg finder";
@@ -495,7 +503,7 @@ async function openAutoBuild({sid, meter, bpm, onApply}) {
   };
   const toPlan = p => ({family: p.family, ts: p.ts, tempo: p.tempo, parts: p.parts.map((x, i) => ({
     cat: x.cat, label: x.label, sound: x.sound, sound_no: x.sound_no, sound_name: x.sound_name,
-    names: x.scenes.map(y => y && y.name), scenes: x.scenes.map(y => y && y.no), part: i < 4 ? i + 1 : 0}))});
+    names: x.scenes.map(y => y && y.name), scenes: x.scenes.map(y => y && y.no), part: i < 4 ? i + 2 : 0}))});
   const applyTabla = p => {
     if (!st.tabla.use || !p) return p;
     const drums = p.parts.find(x => x.cat === "Dr/Pc");
@@ -509,7 +517,7 @@ async function openAutoBuild({sid, meter, bpm, onApply}) {
   function draw() {
     const g = r.groove;
     const finalPlan = applyTabla(plan);
-    const leadPart = finalPlan ? Math.min(8, finalPlan.parts.filter(x => x.part).length + 1) : 5;
+    const leadPart = 1;   // right hand = Part 1; the band sits on Parts 2–5
     dlg._final = {plan: finalPlan, leadPart};
     $("#abody", dlg).innerHTML = `
       <div class="small muted" style="margin:6px 0 10px">${esc(r.meter)} · ${r.bpm ? esc(r.bpm) + " BPM · " : ""}${g ? `${esc(g.feel)} ${esc(g.subdivision)}s · ${esc(g.busy)} drums` : "groove not detected"}
@@ -527,7 +535,8 @@ async function openAutoBuild({sid, meter, bpm, onApply}) {
           <label class="f">Split point (left hand plays the band)</label>
           <select id="asplit">${SPLIT_CHOICES.map(n => `<option value="${n ?? ""}" ${n === st.split ? "selected" : ""}>${n == null ? "No split — whole keyboard" : `${noteName(n)} — left hand below`}</option>`).join("")}</select>
           <label class="f" style="margin-top:8px">Right-hand sound (Part ${leadPart})</label>
-          <div class="row"><span class="grow" id="alead">${st.split == null ? '<span class="muted">— no split</span>' : `${esc(st.lead.name)} <span class="muted">#${st.lead.no}</span>`}</span>
+          <div class="row"><span class="grow" id="alead">${st.split == null ? '<span class="muted">— no split</span>' : st.lead.keep ? 'Keep Part 1 of the Performance you have open' : `${esc(st.lead.name)} <span class="muted">#${st.lead.no}</span>`}</span>
+            ${st.split != null && !st.lead.keep ? `<button class="btn sm" id="aleadkeep">Keep mine</button>` : ""}
             <button class="btn sm" id="aleadpick" ${st.split == null ? "disabled" : ""}>Change</button></div>
           ${st.feel === "indian" ? `<label class="chk"><input type="checkbox" id="atabla" ${st.tabla.use ? "checked" : ""}> Use my tabla arps for drums: User arp
             <input id="atfirst" type="number" min="1" max="249" value="${st.tabla.first}" style="width:60px"> onwards</label>
@@ -538,7 +547,7 @@ async function openAutoBuild({sid, meter, bpm, onApply}) {
           <h3>Plan</h3>
           ${finalPlan ? `<div class="ptable"><table class="sec plan"><thead><tr><th>Part</th><th>Instrument</th><th>Sound</th>${["Intro", "Main A", "Main B", "Main C", "Fill A", "Fill B", "Break", "Ending"].map((n, i) => `<th>S${i + 1}<br><span class="muted">${n}</span></th>`).join("")}</tr></thead><tbody>
             ${finalPlan.parts.filter(x => x.part).map(x => `<tr><td>${x.part}</td><td><b>${esc(x.label)}</b></td><td class="small">${esc(x.sound_name || "–")}</td>${x.scenes.map(n => `<td class="an">${n || "–"}</td>`).join("")}</tr>`).join("")}
-            ${st.split != null ? `<tr><td>${leadPart}</td><td><b>Right hand</b></td><td class="small">${esc(st.lead.name)}</td><td colspan="8" class="small muted">plays from ${noteName(st.split)} up, no arp</td></tr>` : ""}
+            ${st.split != null ? `<tr><td>${leadPart}</td><td><b>Right hand</b></td><td class="small">${st.lead.keep ? "(yours)" : esc(st.lead.name)}</td><td colspan="8" class="small muted">plays from ${noteName(st.split)} up, no arp</td></tr>` : ""}
           </tbody></table></div><div class="small muted" style="margin-top:6px">${SCENE_MIX_TEXT}</div>` : '<div class="muted small">No plan.</div>'}
           <h3 style="margin-top:14px">Sections → scenes</h3>
           ${r.sections.length ? `<table class="sec"><thead><tr><th>Section</th><th>Starts</th><th>Scene</th><th>Chords</th></tr></thead><tbody>
@@ -556,13 +565,14 @@ async function openAutoBuild({sid, meter, bpm, onApply}) {
       chosen = i.value; plan = toPlan(await api(`modx/scene-plan?family=${encodeURIComponent(chosen)}`)); draw();
     });
     $("#asplit", dlg).onchange = e => { st.split = e.target.value === "" ? null : +e.target.value; savePrefs(); draw(); };
-    $("#aleadpick", dlg).onclick = () => openFinder({meter, bpm, onUse: p => { st.lead = {no: p.no, name: p.name}; savePrefs(); draw(); }, onArp: () => {}});
+    $("#aleadpick", dlg).onclick = () => openFinder({meter, bpm, onUse: p => { st.lead = {no: p.no, name: p.name, v2: true}; savePrefs(); draw(); }, onArp: () => {}});
+    $("#aleadkeep", dlg)?.addEventListener("click", () => { st.lead = {keep: true, v2: true}; savePrefs(); draw(); });
     $("#aoff", dlg).onchange = e => { st.othersOff = e.target.checked; savePrefs(); };
     $("#atabla", dlg)?.addEventListener("change", e => { st.tabla.use = e.target.checked; savePrefs(); draw(); });
     $("#atfirst", dlg)?.addEventListener("change", e => { st.tabla.first = Math.max(1, Math.min(249, +e.target.value || 1)); savePrefs(); draw(); });
     $("#asecs", dlg)?.addEventListener("change", e => { st.useSections = e.target.checked; });
     const result = () => ({plan: dlg._final.plan, sections: st.useSections ? r.sections : null,
-      opts: {split: st.split, lead: st.split != null ? {part: dlg._final.leadPart, sound_no: st.lead.no, name: st.lead.name} : null,
+      opts: {split: st.split, lead: st.split != null ? {part: dlg._final.leadPart, sound_no: st.lead.keep ? null : st.lead.no, name: st.lead.name} : null,
         othersOff: st.othersOff, withSounds: true, resetLimits: st.split == null}});
     $("#aapply", dlg).onclick = async () => { await onApply(result(), false); dlg.close(); };
     $("#asend", dlg).onclick = async () => {
