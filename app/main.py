@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import auth as auth_mod
-from . import autobuild, db, lyrics, modx, worker
+from . import autobuild, db, lyrics, modx, pitch, worker
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "web")
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
@@ -27,6 +27,7 @@ def _startup():
     db.init()
     auth_mod.init()
     lyrics.reset_stale_jobs()
+    pitch.reset_stale_jobs()
     worker.start()
 
 
@@ -326,9 +327,41 @@ def _safe_stem(name):
     return name
 
 
+def _preview_path(sid, name, k):
+    name = _safe_stem(name)
+    if k:
+        if not -6 <= k <= 6:
+            raise HTTPException(400, "Key change is −6 to +6")
+        return os.path.join(pitch.key_dir(sid, k), f"{name}.mp3")
+    return os.path.join(db.song_dir(sid), "preview", f"{name}.mp3")
+
+
+class KeyBody(BaseModel):
+    semitones: int
+
+
+@app.get("/api/songs/{sid}/key", dependencies=[Depends(auth)])
+def key_status(sid: str):
+    _song_or_404(sid)
+    return {"available": pitch.available(sid), "job": pitch.job(sid)}
+
+
+@app.post("/api/songs/{sid}/key", dependencies=[Depends(auth)])
+def key_change(sid: str, body: KeyBody):
+    s = _song_or_404(sid)
+    n = body.semitones
+    if not n or not -6 <= n <= 6:
+        raise HTTPException(400, "Key change is −6 to +6 semitones")
+    if s["status"] != "ready":
+        raise HTTPException(409, "Wait until the song has finished processing")
+    if n not in pitch.available(sid) and not pitch.start(sid, n):
+        raise HTTPException(409, "Another key change is running for this song; try again in a minute")
+    return key_status(sid)
+
+
 @app.get("/api/songs/{sid}/preview/{name}.mp3", dependencies=[Depends(auth)])
-def preview(sid: str, name: str):
-    p = os.path.join(db.song_dir(sid), "preview", f"{_safe_stem(name)}.mp3")
+def preview(sid: str, name: str, k: int = 0):
+    p = _preview_path(sid, name, k)
     if not os.path.exists(p):
         raise HTTPException(404, "Not ready")
     return FileResponse(p, media_type="audio/mpeg")
@@ -351,12 +384,12 @@ def stem_wav(sid: str, name: str):
 
 
 @app.get("/api/songs/{sid}/stem/{name}.mp3", dependencies=[Depends(auth)])
-def stem_mp3(sid: str, name: str):
-    """Same 192 kbps file the player streams (~1.4 MB per minute), as a download."""
-    p = os.path.join(db.song_dir(sid), "preview", f"{_safe_stem(name)}.mp3")
+def stem_mp3(sid: str, name: str, k: int = 0):
+    """Same 192 kbps file the player streams (~1.4 MB per minute), as a download; k = key change."""
+    p = _preview_path(sid, name, k)
     if not os.path.exists(p):
         raise HTTPException(404, "Not ready")
-    return FileResponse(p, media_type="audio/mpeg", filename=_fname(sid, name, "mp3"))
+    return FileResponse(p, media_type="audio/mpeg", filename=_fname(sid, f"{name} ({k:+d})" if k else name, "mp3"))
 
 
 @app.get("/api/songs/{sid}/stems.zip", dependencies=[Depends(auth)])
@@ -467,4 +500,13 @@ def health():
 
 
 # Front end (PWA) — mounted last so /api routes win.
+@app.middleware("http")
+async def _no_stale_app(request: Request, call_next):
+    """App files must always be revalidated, or a tablet keeps running an old app.js after an update."""
+    resp = await call_next(request)
+    if not request.url.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="web")

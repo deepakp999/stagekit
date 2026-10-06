@@ -104,8 +104,9 @@ def lrclib_search(query, duration=None):
     synced = [x for x in results if x.get("syncedLyrics")]
     if not synced:
         return None, results[:5]
-    if duration:  # prefer the version whose length matches this recording
-        synced.sort(key=lambda x: abs((x.get("duration") or 0) - duration))
+    # Prefer Malayalam-script or English (Latin) lyrics, then the version whose length matches this recording.
+    synced.sort(key=lambda x: (not readable_script(x["syncedLyrics"]),
+                               abs((x.get("duration") or 0) - duration) if duration else 0))
     best = synced[0]
     return best, synced[:5]
 
@@ -237,3 +238,49 @@ def manglish(text):
 
 def has_malayalam(text):
     return any("ഀ" <= c <= "ൿ" for c in text or "")
+
+
+# Other Indian scripts -> roman letters, so Tamil/Hindi/Telugu/Kannada songs are readable.
+_SCRIPTS = [(0x0900, 0x097F, "DEVANAGARI"), (0x0980, 0x09FF, "BENGALI"), (0x0A00, 0x0A7F, "GURMUKHI"),
+            (0x0A80, 0x0AFF, "GUJARATI"), (0x0B80, 0x0BFF, "TAMIL"), (0x0C00, 0x0C7F, "TELUGU"),
+            (0x0C80, 0x0CFF, "KANNADA")]
+_ITRANS_CLEAN = [("~N", "n"), ("~n", "nj"), (".N", "n"), (".n", "n"), (".h", ""), (".a", ""), ("^", ""), ("RRi", "ru"),
+                 ("Sh", "sh"), ("A", "aa"), ("I", "ee"), ("U", "oo"), ("M", "m"), ("H", "h"), ("T", "t"), ("D", "d"),
+                 ("N", "n"), ("L", "l"), ("R", "r"), ("x", "ksh"), ("GY", "gy"), ("~", ""), ("E", "e"), ("O", "o")]
+
+
+def other_indic(text):
+    for c in text or "":
+        o = ord(c)
+        for lo, hi, name in _SCRIPTS:
+            if lo <= o <= hi:
+                return name
+    return None
+
+
+def readable_script(text):
+    """Malayalam script or Latin: what the user can read directly."""
+    return has_malayalam(text) or not other_indic(text)
+
+
+def romanize(text):
+    if has_malayalam(text):
+        return manglish(text)
+    script = other_indic(text)
+    if not script:
+        return text
+    try:
+        from indic_transliteration import sanscript
+        out = sanscript.transliterate(text, getattr(sanscript, script), sanscript.ITRANS)
+    except Exception:
+        return text
+    for x, y in _ITRANS_CLEAN:
+        out = out.replace(x, y)
+    # Leftover Tamil letters the scheme doesn't cover, and accented vowels.
+    for x, y in (("\u0ba9", "n"), ("\u0bb4", "zh"), ("\u0bb1", "r"), ("\u0bb3", "l"), ("\u0bcd", ""),
+                 ("\u00e8", "e"), ("\u00f2", "o"), ("\u00e9", "e")):
+        out = out.replace(x, y)
+    out = out.lower()
+    if script in ("DEVANAGARI", "GURMUKHI", "GUJARATI", "BENGALI"):  # Hindi-style: no "a" at the end of words
+        out = re.sub(r"\b([a-z]{2,}?[^aeiou\s])a\b", r"\1", out)
+    return out
