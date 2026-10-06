@@ -1,5 +1,5 @@
 // App shell cached for offline use on stage. Song data: network first, cached copy if offline.
-const SHELL = "stagekit-shell-v11";
+const SHELL = "stagekit-shell-v13";
 const DATA = "stagekit-data-v1";
 const FILES = ["./", "index.html", "styles.css", "app.js", "tabla.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "icon-512.png"];
 
@@ -25,7 +25,7 @@ self.addEventListener("fetch", e => {
   }
   // App files: network first so updates arrive immediately; cached copy when offline.
   e.respondWith(
-    fetch(e.request).then(r => {
+    fetch(e.request, {cache: "no-cache"}).then(r => {
       if (r.ok) { const copy = r.clone(); caches.open(SHELL).then(c => c.put(e.request, copy)); }
       return r;
     }).catch(() => caches.match(e.request).then(r => r || caches.match("index.html")))

@@ -193,7 +193,7 @@ class Mixer {
     // Instrumental duplicates drums+bass+other, and original is the full mix: both start muted.
     this.tracks = [...stems, "original"].map(name => ({name, a: null, vol: 1,
       mute: name === "instrumental" || (name === "original" && stems.length > 0), solo: false}));
-    this.onTick = null; this.playing = false; this.duration = 0;
+    this.onTick = null; this.onKey = null; this.playing = false; this.duration = 0; this.key = 0;
     this.render(); this.load();
   }
   render() {
@@ -203,13 +203,16 @@ class Mixer {
         <input class="seek" id="mxseek" type="range" min="0" max="1000" value="0" disabled aria-label="Position">
         <span class="time" id="mxtime">Loading…</span>
       </div>
+      <div class="keyrow"><span class="small muted">Key</span>
+        <button class="btn sm" id="mxkd" aria-label="Key down a semitone">−</button><b id="mxkv">0</b><button class="btn sm" id="mxku" aria-label="Key up a semitone">+</button>
+        <span class="small muted" id="mxkm">Shift the whole song up or down (tempo stays the same)</span></div>
       ${this.tracks.map((t, i) => `
         <div class="stem" style="--c:var(--${t.name})">
           <span class="n">${STEM_LABEL[t.name]}</span>
           <button class="tog m ${t.mute ? "on" : ""}" data-i="${i}" data-k="mute" aria-label="Mute ${t.name}">M</button>
           <button class="tog s" data-i="${i}" data-k="solo" aria-label="Solo ${t.name}">S</button>
           <input type="range" min="0" max="1" step="0.01" value="1" data-i="${i}" aria-label="${t.name} volume">
-          ${t.name === "original" && this.tracks.length === 1 ? "<span></span>" : `<span class="dl"><a href="api/songs/${this.sid}/stem/${t.name}.mp3" download title="MP3, ~1.4 MB per minute">MP3</a><a href="api/songs/${this.sid}/stem/${t.name}.wav" download title="WAV, full quality, ~10 MB per minute">WAV</a></span>`}
+          ${t.name === "original" && this.tracks.length === 1 ? "<span></span>" : `<span class="dl"><a class="mp3" data-n="${t.name}" href="api/songs/${this.sid}/stem/${t.name}.mp3" download title="MP3, ~1.4 MB per minute">MP3</a><a href="api/songs/${this.sid}/stem/${t.name}.wav" download title="WAV, full quality, ~10 MB per minute">WAV</a></span>`}
         </div>`).join("")}`;
     $$(".tog", this.el).forEach(b => b.onclick = () => {
       const t = this.tracks[b.dataset.i]; t[b.dataset.k] = !t[b.dataset.k];
@@ -217,6 +220,8 @@ class Mixer {
     });
     $$(".stem input", this.el).forEach(r => r.oninput = () => { this.tracks[r.dataset.i].vol = +r.value; this.applyGains(); });
     $("#mxplay", this.el).onclick = () => this.playing ? this.pause() : this.play();
+    $("#mxkd", this.el).onclick = () => this.nudgeKey(-1);
+    $("#mxku", this.el).onclick = () => this.nudgeKey(1);
     const seek = $("#mxseek", this.el);
     seek.oninput = () => { this.seeking = true; $("#mxtime", this.el).textContent = `${fmtTime(seek.value / 1000 * this.duration)} / ${fmtTime(this.duration)}`; };
     seek.onchange = () => { this.seeking = false; this.seek(seek.value / 1000 * this.duration); };
@@ -233,8 +238,59 @@ class Mixer {
       }, {once: true});
       a.addEventListener("error", () => this.msg(`Could not load ${STEM_LABEL[t.name] || t.name} (${a.error?.code || "?"}) — reload the page`));
       a.addEventListener("ended", () => { if (t === this.tracks[0]) { this.pause(); this.seek(0); } });
-      a.src = `api/songs/${this.sid}/preview/${t.name}.mp3`;
+      a.src = this.url(t.name, this.key);
     }
+  }
+  url(name, k) { return `api/songs/${this.sid}/preview/${name}.mp3${k ? `?k=${k}` : ""}`; }
+  // Key change: the server pitch-shifts every stem once per key (about a minute), then we swap the audio in place.
+  // Taps add up for a moment before anything is processed, so tapping + twice goes straight to +2.
+  nudgeKey(d) {
+    this.want = Math.max(-6, Math.min(6, (this.want ?? this.key) + d));
+    const k = this.want; $("#mxkv", this.el).textContent = k ? (k > 0 ? `+${k}` : `${k}`) : "0";
+    clearTimeout(this.keyTimer);
+    this.keyTimer = setTimeout(() => this.changeKey(this.want), 900);
+  }
+  async changeKey(n) {
+    if (n < -6 || n > 6) return;
+    if (this.keyBusy) return;   // the running change picks up this.want when it finishes
+    const kv = $("#mxkv", this.el), km = $("#mxkm", this.el);
+    const label = k => k ? (k > 0 ? `+${k}` : `${k}`) : "0";
+    this.keyBusy = true; kv.textContent = label(n);
+    try {
+      if (n) {
+        let st = await api(`songs/${this.sid}/key`);
+        if (!st.available.includes(n)) {
+          st = await api(`songs/${this.sid}/key`, {method: "POST", json: {semitones: n}});
+          const t0 = Date.now();
+          while (!st.available.includes(n) && !this.dead) {
+            if (st.job?.status === "error") throw new Error(st.job.message);
+            km.innerHTML = `<span class="spin"></span> Making key ${label(n)}… ${Math.round((Date.now() - t0) / 1000)} s (about a minute; keep playing meanwhile)`;
+            await new Promise(r => setTimeout(r, 3000));
+            st = await api(`songs/${this.sid}/key`);
+          }
+        }
+      }
+      if (this.dead) return;
+      await this.swap(n);
+      km.textContent = n ? `Playing ${label(n)} semitone${Math.abs(n) > 1 ? "s" : ""} ${n > 0 ? "up" : "down"} · chords follow` : "Original key";
+    } catch (e) { kv.textContent = label(this.key); this.want = this.key; km.textContent = "Key change failed: " + e.message; }
+    finally {
+      this.keyBusy = false;
+      if (!this.dead && this.want != null && this.want !== this.key) this.changeKey(this.want);
+    }
+  }
+  async swap(n) {
+    const was = this.playing, p = this.pos();
+    if (was) this.pause();
+    await Promise.all(this.tracks.map(t => new Promise(res => {
+      t.a.addEventListener("loadedmetadata", res, {once: true}); t.a.addEventListener("error", res, {once: true});
+      t.a.src = this.url(t.name, n);
+    })));
+    for (const t of this.tracks) t.a.currentTime = p;
+    this.key = n; this.applyGains();
+    $$(".mp3", this.el).forEach(a => a.href = `api/songs/${this.sid}/stem/${a.dataset.n}.mp3${n ? `?k=${n}` : ""}`);
+    this.onKey?.(n);
+    if (was) this.play();
   }
   ready() {
     if (this.dead) return;
@@ -734,17 +790,20 @@ function layoutLyrics(lines, chords, tp, roman) {
 }
 
 function lyricsPanel(sid, el, getMixer, getTp, canTranscribe) {
-  let data = {lines: []}, chords = [], roman = false, tapping = -1, poll = null, dead = false, cur = -1;
-  try { roman = localStorage.getItem("sk_roman") === "1"; } catch {}
+  let data = {lines: []}, chords = [], roman = false, romanChosen = false, tapping = -1, poll = null, dead = false, cur = -1;
+  try { const v = localStorage.getItem("sk_roman"); roman = v === "1"; romanChosen = v != null; } catch {}
   api(`songs/${sid}/chords`).then(c => { chords = c; draw(); }).catch(() => {});
 
   const load = async () => {
     try { data = await api(`songs/${sid}/lyrics`); } catch (e) { data = {lines: [], job: {status: "error", message: e.message}}; }
+    lineRoman = data.roman_default ? true : null;
     draw();
     clearTimeout(poll);
     if (data.job?.status === "running" && !dead) poll = setTimeout(load, 3000);
   };
 
+  let lineRoman = null;   // true = this song's script isn't Malayalam, show roman letters
+  const useRoman = () => lineRoman ?? roman;
   const untimed = () => data.lines.length && data.lines.some(l => l.t == null);
 
   function draw() {
@@ -753,7 +812,7 @@ function lyricsPanel(sid, el, getMixer, getTp, canTranscribe) {
     const src = {lrclib: `LRCLIB${data.match ? ` · ${data.match}` : ""}`, whisper: `transcribed${data.language ? ` (${data.language})` : ""}`, pasted: "pasted"}[data.source] || "";
     el.innerHTML = `
       <div class="row"><b class="grow">Lyrics + chords ${src ? `<span class="muted small">· ${esc(src)}</span>` : ""}</b>
-        ${data.malayalam ? `<button class="btn sm" id="lyscript" title="Malayalam script / Manglish">${roman ? "മ" : "Aa"}</button>` : ""}
+        ${data.malayalam ? `<button class="btn sm" id="lyscript" title="Original script / roman letters">${useRoman() ? "Script" : "Aa"}</button>` : ""}
         ${has ? `<button class="btn sm" id="lymenu" aria-label="Lyrics options">⋯</button>` : ""}</div>
       ${job?.status === "running" ? `<div class="small" style="margin:8px 0"><span class="spin"></span> ${esc(job.message)}</div>` : ""}
       ${job?.status === "error" ? `<div class="small" style="margin:8px 0;color:var(--danger)">${esc(job.message)}</div>` : ""}
@@ -762,11 +821,11 @@ function lyricsPanel(sid, el, getMixer, getTp, canTranscribe) {
           <div class="row"><input id="lyq" type="text" value="${esc(data.query || data.suggested_query || "")}" placeholder="Song name + film" aria-label="Search lyrics">
             <button class="btn primary sm" id="lylrc">Find lyrics</button></div>
           <div class="row" style="margin-top:6px">
-            ${canTranscribe ? `<select id="lylang" aria-label="Language"><option value="">Auto language</option><option value="ml">Malayalam</option><option value="hi">Hindi</option><option value="ta">Tamil</option><option value="te">Telugu</option><option value="kn">Kannada</option><option value="en">English</option></select>
+            ${canTranscribe ? `<select id="lylang" aria-label="Language"><option value="ml">Malayalam</option><option value="en">English</option></select>
             <button class="btn sm" id="lywh">Transcribe vocals</button>` : ""}
             <button class="btn sm" id="lypaste">Paste lyrics</button>
             ${has ? `<button class="btn sm" id="lyretime">Re-time by tapping</button><button class="btn sm danger" id="lydel">Remove</button>` : ""}</div>
-          <div class="small muted" style="margin-top:6px">Find = synced lyrics from LRCLIB (free). Transcribe = speech-to-text on the vocal stem, a few minutes, rough for Malayalam. Paste = your own; then tap along once to time the lines.</div>
+          <div class="small muted" style="margin-top:6px">Find = synced lyrics from LRCLIB (free); Malayalam or English versions are preferred, other scripts are shown in roman letters. Transcribe = speech-to-text on the vocal stem, a few minutes, rough for Malayalam. Paste = your own; then tap along once to time the lines.</div>
         </div>` : ""}
       ${has && data.lines.some(l => l.t != null) ? `<div class="row small muted" style="margin-top:8px">Timing <button class="btn sm" data-shift="-0.5">−0.5s</button><button class="btn sm" data-shift="0.5">+0.5s</button><span class="grow"></span>Tap a line to jump there</div>` : ""}
       ${tapping >= 0 || untimed() ? `<div class="tapbar"><button class="btn primary" id="lytap">${tapping >= 0 ? `Tap: line ${tapping + 1} of ${data.lines.length}` : "▶ Start tap timing"}</button>
@@ -778,16 +837,19 @@ function lyricsPanel(sid, el, getMixer, getTp, canTranscribe) {
 
   function sheet(tp) {
     if (untimed() || !chords.length) {
-      return data.lines.map((l, i) => `<div class="ll" data-i="${i}"><span class="lt">${esc((roman && l.roman) || l.text)}</span></div>`).join("");
+      return data.lines.map((l, i) => `<div class="ll" data-i="${i}"><span class="lt">${esc((useRoman() && l.roman) || l.text)}</span></div>`).join("");
     }
-    return layoutLyrics(data.lines, chords, tp, roman).map(r => r.kind === "inst"
+    return layoutLyrics(data.lines, chords, tp, useRoman()).map(r => r.kind === "inst"
       ? `<div class="li" data-t="${r.t}">${r.chords.map(esc).join("  ")}</div>`
       : `<div class="ll" data-i="${r.idx}" data-t="${r.t}">${r.words.map(w => `<span class="lw"><b>${esc(w.c) || "&nbsp;"}</b>${esc(w.w)}</span>`).join(" ")}</div>`).join("");
   }
 
   function bind() {
     const on = (id, f) => { const b = $(id, el); if (b) b.onclick = f; };
-    on("#lyscript", () => { roman = !roman; try { localStorage.setItem("sk_roman", roman ? "1" : "0"); } catch {} draw(); });
+    on("#lyscript", () => {
+      if (lineRoman != null) { lineRoman = !lineRoman; return draw(); }
+      roman = !roman; try { localStorage.setItem("sk_roman", roman ? "1" : "0"); } catch {} draw();
+    });
     on("#lymenu", () => { el.dataset.menu ? delete el.dataset.menu : el.dataset.menu = "1"; draw(); });
     on("#lylrc", () => start("lrclib", {query: $("#lyq", el).value}));
     on("#lywh", () => start("whisper", {language: $("#lylang", el).value}));
@@ -1051,6 +1113,7 @@ async function songView(sid) {
     }
     const lyr = lyricsPanel(sid, $("#lyrp"), () => mixer, () => transpose, s.status === "ready");
     if (mixer) mixer.onTick = p => { if (s.has_chords) follow(p); lyr.follow(p); };
+    if (mixer) mixer.onKey = n => { transpose = n; if (s.has_chords) drawChart0(); lyr.draw(); };
     const drawChart0 = drawChart;
     if (s.has_chords) { $("#tpd").onclick = () => { transpose = Math.max(-11, transpose - 1); drawChart0(); lyr.draw(); };
       $("#tpu").onclick = () => { transpose = Math.min(11, transpose + 1); drawChart0(); lyr.draw(); }; }

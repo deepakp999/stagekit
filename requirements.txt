@@ -8,3 +8,4 @@ librosa>=0.10
 audioread
 numpy
 faster-whisper>=1.0
+indic-transliteration
