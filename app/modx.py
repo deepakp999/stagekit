@@ -192,6 +192,25 @@ def _pick(arps, prefixes):
     return None
 
 
+def _scene_arps(arps):
+    """One arp per scene, rising in energy: Main A < Main B < Main C, using whichever main
+    variations (MA–MD) this instrument actually has, so neighbouring scenes don't repeat."""
+    def best(var):
+        c = sorted([a for a in arps if a["var"] == var], key=lambda a: (a["n"] not in ("", "1"), a["no"]))
+        return c[0] if c else None
+    mains = [best(v) for v in ("MA", "MB", "MC", "MD") if best(v)]
+    fills = [best(v) for v in ("FA", "FB", "FC") if best(v)]
+    if not mains:
+        mains = [sorted(arps, key=lambda a: a["no"])[0]]
+    lo, hi = mains[0], mains[-1]
+    mid = mains[1] if len(mains) > 2 else mains[-1] if len(mains) == 2 else lo
+    if len(mains) == 2:  # only two: A = low, B and C = high
+        mid = hi
+    fill_a = fills[0] if fills else hi
+    fill_b = fills[1] if len(fills) > 1 else fill_a
+    return [best("IA") or lo, lo, mid, hi, fill_a, fill_b, best("BA") or lo, best("EA") or best("EB") or lo]
+
+
 def scene_plan(family):
     s = STYLES.get(family)
     if not s:
@@ -201,10 +220,7 @@ def scene_plan(family):
         arps = s["parts"].get(cat)
         if not arps:
             continue
-        row = []
-        for _, prefs in SCENE_SLOTS:
-            a = _pick(arps, prefs) or _pick(arps, ["MA", "MB", "MC", "MD"])
-            row.append({"no": a["no"], "name": a["name"], "var": a["var"]} if a else None)
+        row = [{"no": a["no"], "name": a["name"], "var": a["var"]} if a else None for a in _scene_arps(arps)]
         kit = next((a.get("sound") for a in arps if a.get("sound")), None)
         parts.append({"cat": cat, "label": INSTR_LABEL.get(cat, cat), "sound": kit, "scenes": row})
     return {"family": family, "ts": s["ts"], "tempo": s["tempo"], "sub": s["sub"],

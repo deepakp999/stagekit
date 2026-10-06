@@ -302,12 +302,38 @@ const MIDI = {
     if (!this.out) toast("No MIDI device found. Connect the MODX by USB.");
     return this.out;
   },
+  // Parameter request F0 43 3n 7F 1C 0D a1–a4 F7; the MODX answers with a parameter change for that address.
+  read(addr, timeout = 500) {
+    const ins = [...(this.access?.inputs.values() || [])].filter(i => /modx|yamaha|montage/i.test(i.name) || this.access.inputs.size === 1);
+    if (!ins.length || !this.out) return Promise.resolve(null);
+    return new Promise(res => {
+      const done = v => { clearTimeout(t); ins.forEach(i => i.removeEventListener("midimessage", on)); res(v); };
+      const on = e => {
+        const d = e.data;
+        if (d[0] === 0xF0 && d[1] === 0x43 && (d[2] & 0xF0) === 0x10 && d[4] === 0x1C && d[5] === 0x0D &&
+            d[6] === addr[0] && d[7] === addr[1] && d[8] === addr[2] && d[9] === addr[3]) done([...d.slice(10, d.length - 1)]);
+      };
+      const t = setTimeout(() => done(null), timeout);
+      ins.forEach(i => i.addEventListener("midimessage", on));
+      this.out.send([0xF0, 0x43, 0x30, 0x7F, 0x1C, 0x0D, ...addr, 0xF7]);
+    });
+  },
   async preset(n) {
     const out = await this.ensure(); if (!out) return;
     const ch = ((midiSettings().channel || 1) - 1) & 15;
     presetMsgs(n, ch).forEach(m => out.send(m));
   },
 };
+
+// Scene order: Intro, Main A, Main B, Main C, Fill A, Fill B, Break, Ending (scene index 0–7).
+// Intro: no bass. Main A (verse): sparse. Main C (chorus): loudest. Break: drums and bass drop out.
+const SCENE_MIX = {
+  drums: {mute: [6], vol: [92, 95, 100, 112, 112, 112, 100, 105]},
+  bass:  {mute: [0, 6], vol: [100, 100, 105, 112, 112, 112, 100, 105]},
+  comp:  {mute: [], vol: [100, 95, 100, 108, 105, 105, 105, 100]},
+  comp2: {mute: [0, 1, 6], vol: [100, 100, 95, 105, 105, 105, 100, 100]},
+};
+const SCENE_MIX_TEXT = "Scenes also change the mix: Intro without bass, Main A sparse (2nd keys/guitar out), Main C loudest, Break drops drums and bass.";
 
 // Yamaha parameter change: F0 43 1n 7F 1C 0D a1 a2 a3 a4 data F7 (MODX M Data List, MIDI Data Format 3-5-3).
 const ymh = (addr, data) => [0xF0, 0x43, 0x10, 0x7F, 0x1C, 0x0D, ...addr, ...data, 0xF7];
@@ -336,7 +362,21 @@ function scenePlanMessages(plan, tempo, opts = {}) {
     limits(p, opts.split != null ? opts.split : 0, 127);
   }
   if (opts.othersOff) for (let p = 0; p < 16; p++) if (!used.has(p)) part1(p, 0x00, 0);
+  if (opts.dynamics !== false) {
+    // Each scene also changes the mix (Scene Part Mute / Volume, block 1p 3 0c): an arrangement, not just new patterns.
+    const vol = (p, c, v) => msgs.push(ymh([0x10 + p, 0x03, c, 0x02], [0, v]));
+    const mute = (p, c, on) => msgs.push(ymh([0x10 + p, 0x03, c, 0x00], [0, on ? 1 : 0]));
+    let comp = 0;
+    for (const row of plan.parts) {
+      if (!row.part) continue;
+      const role = row.cat === "Dr/Pc" ? "drums" : row.cat === "Bass" ? "bass" : comp++ === 0 ? "comp" : "comp2";
+      const d = SCENE_MIX[role];
+      for (let c = 0; c < 8; c++) { mute(row.part - 1, c, d.mute.includes(c)); vol(row.part - 1, c, d.vol[c]); }
+    }
+    if (opts.lead && opts.lead.part) for (let c = 0; c < 8; c++) { mute(opts.lead.part - 1, c, false); vol(opts.lead.part - 1, c, 100); }
+  }
   for (let c = 0; c < 8; c++) {
+    if (opts.dynamics !== false) msgs.push(ymh([0x06, 0x02, c, 0x05], [1]));  // Scene Mixing Memorize Switch on
     msgs.push(ymh([0x06, 0x02, c, 0x00], [1]));      // Scene Arpeggio Master Switch on
     msgs.push(ymh([0x06, 0x02, c, 0x02], [1]));      // Scene Arpeggio Memorize Switch on
     msgs.push(ymh([0x06, 0x03, c, 0x00], [0, c]));   // Scene c+1 → Arp Select c+1
@@ -354,17 +394,74 @@ async function sendPlanToModx(plan, bpm, opts = {}) {
   if (!confirm("This changes the Performance currently open on your MODX (sounds, arps, scenes" + (opts.othersOff ? ", other Parts off" : "") +
     "). Nothing is saved until you press STORE; reloading the Performance undoes it. Continue?")) return false;
   const wait = ms => new Promise(r => setTimeout(r, ms));
+  const kc = (p, on) => out.send(ymh([0x10 + p, 0x00, 0x01, 0x02], [on ? 1 : 0]));
   try {
+    const loads = [];
     if (opts.withSounds !== false) {
-      // Single Part bank select (MSB 63) on each Part's channel replaces just that Part's sound (MIDI I/O Mode: Multi).
-      for (const r of plan.parts) if (r.part && r.sound_no) presetMsgs(r.sound_no, r.part - 1, 63).forEach(m => out.send(m));
-      if (opts.lead && opts.lead.part && opts.lead.sound_no) presetMsgs(opts.lead.sound_no, opts.lead.part - 1, 63).forEach(m => out.send(m));
-      await wait(1200); // let the MODX finish loading sounds before setting Part parameters
+      for (const r of plan.parts) if (r.part && r.sound_no) loads.push({part: r.part, no: r.sound_no});
+      if (opts.lead && opts.lead.part && opts.lead.sound_no) loads.push({part: opts.lead.part, no: opts.lead.sound_no});
     }
-    for (const m of scenePlanMessages(plan, bpm, opts)) { out.send(m); await wait(12); }
-    toast("Sent. Hold a chord" + (opts.split != null ? " with your left hand" : "") + " and try scenes 1–8; press STORE on the MODX to keep it.", 7000);
+    if (loads.length) {
+      // Parts with Keyboard Control on all listen on the keyboard channel, so a Program Change there lands in the
+      // wrong Part. Switch it off for Parts 1–8 and give each its own channel (Tx/Rx Channel = Part number) first.
+      for (let p = 0; p < 8; p++) { kc(p, false); out.send(ymh([0x10 + p, 0x00, 0x08, 0x02], [0, p])); }
+      await wait(200);
+      for (const [i, l] of loads.entries()) {
+        toast(`Loading sound ${i + 1} of ${loads.length} into Part ${l.part}…`, 3000);
+        presetMsgs(l.no, l.part - 1, 63).forEach(m => out.send(m));   // Single Part bank select (MSB 63)
+        await wait(1000);
+        kc(l.part - 1, false);  // the loaded preset may switch it back on; keep it off until everything is loaded
+      }
+      await wait(300);
+    }
+    toast("Setting arps and scenes…", 3000);
+    for (const m of scenePlanMessages(plan, bpm, opts)) { out.send(m); await wait(8); }
+    await wait(300);
+    const report = await verifyPlan(plan, opts);
+    showSendReport(report);
     return true;
   } catch (e) { toast("Sending failed: " + e.message + " — allow full MIDI (SysEx) access in Chrome.", 7000); return false; }
+}
+
+// Reads back each Part's name and Arp 1–8 numbers from the MODX so you can see what actually landed.
+async function verifyPlan(plan, opts) {
+  const rows = [];
+  for (const r of plan.parts.filter(x => x.part)) {
+    const p = r.part - 1;
+    let name = "";
+    for (let i = 0; i < 20; i++) {
+      const d = await MIDI.read([0x10 + p, 0x00, 0x00, i], 300);
+      if (!d) { name = null; break; }
+      if (!d[0]) break;
+      name += String.fromCharCode(d[0]);
+    }
+    const arps = [];
+    for (let i = 0; i < 8; i++) {
+      const d = await MIDI.read([0x10 + p, 0x00, 0x06, 0x44 + 2 * i], 300);
+      arps.push(d ? (d[0] << 7) | d[1] : null);
+    }
+    rows.push({part: r.part, label: r.label, want: r.sound_name, name: name == null ? null : name.trim(),
+      arpsOk: arps.every((n, i) => n === (r.scenes[i] || 0)), arps, wantArps: r.scenes});
+  }
+  return rows;
+}
+
+function showSendReport(rows) {
+  const answered = rows.some(r => r.name != null || r.arps.some(n => n != null));
+  const dlg = document.createElement("dialog"); dlg.className = "mdlg";
+  dlg.innerHTML = `<b>Sent to the MODX</b>
+    ${answered ? `<table class="sec" style="margin-top:8px"><thead><tr><th>Part</th><th>Should be</th><th>MODX has</th><th>Arps</th></tr></thead><tbody>
+      ${rows.map(r => `<tr><td>${r.part}</td><td><b>${esc(r.label)}</b><br><span class="small muted">${esc(r.want || "")}</span></td>
+        <td class="small">${esc(r.name ?? "?")}</td><td>${r.arpsOk ? "✓" : `<span style="color:var(--danger)">✗</span><br><span class="small muted">${r.arps.map(n => n ?? "?").join(" ")}</span>`}</td></tr>`).join("")}
+      </tbody></table>
+      ${rows.every(r => r.arpsOk) ? "" : `<div class="small" style="color:var(--danger);margin-top:6px">Some arps didn't stick. Check Utility → Settings → MIDI: Device Number = All (or 1), and send again.</div>`}`
+    : `<div class="small muted" style="margin-top:8px">The MODX didn't answer the check (it only answers when its MIDI Device Number is All or 1). The settings were still sent.</div>`}
+    <div class="small" style="margin-top:8px">${SCENE_MIX_TEXT} Hold a chord${rows.length ? " in your left hand" : ""} and step through scenes 1–8. Press <b>STORE</b> on the MODX to keep it.</div>
+    <div class="row" style="margin-top:12px"><span class="grow"></span><button class="btn primary" id="srok">OK</button></div>`;
+  document.body.append(dlg);
+  $("#srok", dlg).onclick = () => dlg.close();
+  dlg.addEventListener("close", () => dlg.remove());
+  dlg.showModal();
 }
 
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -442,7 +539,7 @@ async function openAutoBuild({sid, meter, bpm, onApply}) {
           ${finalPlan ? `<div class="ptable"><table class="sec plan"><thead><tr><th>Part</th><th>Instrument</th><th>Sound</th>${["Intro", "Main A", "Main B", "Main C", "Fill A", "Fill B", "Break", "Ending"].map((n, i) => `<th>S${i + 1}<br><span class="muted">${n}</span></th>`).join("")}</tr></thead><tbody>
             ${finalPlan.parts.filter(x => x.part).map(x => `<tr><td>${x.part}</td><td><b>${esc(x.label)}</b></td><td class="small">${esc(x.sound_name || "–")}</td>${x.scenes.map(n => `<td class="an">${n || "–"}</td>`).join("")}</tr>`).join("")}
             ${st.split != null ? `<tr><td>${leadPart}</td><td><b>Right hand</b></td><td class="small">${esc(st.lead.name)}</td><td colspan="8" class="small muted">plays from ${noteName(st.split)} up, no arp</td></tr>` : ""}
-          </tbody></table></div>` : '<div class="muted small">No plan.</div>'}
+          </tbody></table></div><div class="small muted" style="margin-top:6px">${SCENE_MIX_TEXT}</div>` : '<div class="muted small">No plan.</div>'}
           <h3 style="margin-top:14px">Sections → scenes</h3>
           ${r.sections.length ? `<table class="sec"><thead><tr><th>Section</th><th>Starts</th><th>Scene</th><th>Chords</th></tr></thead><tbody>
             ${r.sections.map(x => `<tr><td><b>${esc(x.name)}</b>${x.cue ? `<br><span class="small muted">${esc(x.cue)}</span>` : ""}</td><td>${fmtTime(x.start)}</td><td>S${x.scene}</td><td class="small">${esc(x.chords || "")}</td></tr>`).join("")}
