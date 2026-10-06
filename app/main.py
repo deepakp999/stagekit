@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import auth as auth_mod
-from . import autobuild, db, lyrics, modx, pitch, worker
+from . import ai, autobuild, db, jam, lyrics, modx, pitch, worker
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "web")
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
@@ -482,6 +482,34 @@ def modx_suggest(feel: str = "pop", meter: str = "4/4", bpm: Optional[float] = N
 @app.get("/api/modx/styles", dependencies=[Depends(auth)])
 def modx_styles(q: str = "", meter: str = "", bpm: Optional[float] = None):
     return modx.list_styles(q, meter, bpm)
+
+
+# ---------- jam: shuffle / describe ----------
+
+class JamBody(BaseModel):
+    genre: str = ""
+    seed: Optional[int] = None
+    text: str = ""
+
+
+@app.get("/api/jam/genres", dependencies=[Depends(auth)])
+def jam_genres():
+    return {"genres": jam.all_genres(), "ai": ai.enabled(), "model": ai.OPENROUTER_MODEL if ai.enabled() else None}
+
+
+@app.post("/api/jam/shuffle", dependencies=[Depends(auth)])
+def jam_shuffle(body: JamBody):
+    return _plain(jam.shuffle(body.genre or None, body.seed))
+
+
+@app.post("/api/jam/describe", dependencies=[Depends(auth)])
+def jam_describe(body: JamBody):
+    if not body.text.strip():
+        raise HTTPException(400, "Describe the mix you want")
+    try:
+        return _plain(ai.describe(body.text))
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.get("/api/modx/scene-plan", dependencies=[Depends(auth)])

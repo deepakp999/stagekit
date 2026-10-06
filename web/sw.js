@@ -1,7 +1,7 @@
 // App shell cached for offline use on stage. Song data: network first, cached copy if offline.
-const SHELL = "stagekit-shell-v16";
+const SHELL = "stagekit-shell-v17";
 const DATA = "stagekit-data-v1";
-const FILES = ["./", "index.html", "styles.css", "app.js", "tabla.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "icon-512.png"];
+const FILES = ["./", "index.html", "styles.css", "app.js", "tabla.js", "jam.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "icon-512.png"];
 
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(SHELL).then(c => c.addAll(FILES)).then(() => self.skipWaiting()));

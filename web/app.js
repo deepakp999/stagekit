@@ -56,6 +56,7 @@ async function route() {
     else if (parts[0] === "sets") { setNav("sets"); await setsView(); }
     else if (parts[0] === "live") { await liveView(parts[1], parts[2]); }
     else if (parts[0] === "tabla") { setNav("tabla"); await tablaView(); }
+    else if (parts[0] === "jam") { setNav("jam"); await jamView(); }
     else { setNav("library"); await libraryView(); }
   } catch (e) {
     if (e.message !== "Login required") view.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
@@ -463,6 +464,16 @@ const SCENE_MIX = {
   comp:  {mute: [], vol: [100, 95, 100, 108, 105, 105, 105, 100]},
   comp2: {mute: [0, 1, 6], vol: [100, 100, 95, 105, 105, 105, 100, 100]},
 };
+// Electronic structure: Intro, Groove, Build-up, Drop, Riser, Fill, Breakdown, Outro.
+const SCENE_MIX_EDM = {
+  drums:   {mute: [6], vol: [90, 100, 92, 115, 110, 110, 100, 95]},
+  perc:    {mute: [0, 6, 7], vol: [90, 95, 100, 108, 105, 105, 90, 90]},
+  bass:    {mute: [0, 2, 6], vol: [100, 105, 100, 115, 110, 110, 100, 100]},
+  gtr:     {mute: [0], vol: [95, 100, 104, 108, 104, 104, 100, 95]},
+  keys:    {mute: [], vol: [92, 95, 100, 104, 100, 100, 105, 95]},
+  strings: {mute: [0, 1], vol: [90, 90, 98, 110, 105, 105, 108, 100]},
+  pad:     {mute: [], vol: [100, 88, 92, 85, 85, 85, 105, 100]},
+};
 const SCENE_MIX_TEXT = "Scenes also change the mix: Intro without bass, Verse sparse, Chorus fullest (strings and percussion in), Break drops drums and bass.";
 const roleOf = (row, compIdx) => row.role || (row.cat === "Dr/Pc" ? "drums" : row.cat === "Bass" ? "bass" : compIdx === 0 ? "comp" : "comp2");
 
@@ -505,7 +516,7 @@ function scenePlanMessages(plan, tempo, opts = {}) {
     for (const row of plan.parts) {
       if (!row.part) continue;
       const role = roleOf(row, row.role ? 0 : comp++);
-      const d = SCENE_MIX[role] || SCENE_MIX.comp;
+      const d = (plan.edm && SCENE_MIX_EDM[role]) || SCENE_MIX[role] || SCENE_MIX.comp;
       for (let c = 0; c < 8; c++) { mute(row.part - 1, c, d.mute.includes(c)); vol(row.part - 1, c, d.vol[c]); }
     }
     if (opts.lead && opts.lead.part) for (let c = 0; c < 8; c++) { mute(opts.lead.part - 1, c, false); vol(opts.lead.part - 1, c, 100); }
@@ -528,6 +539,8 @@ function scenePlanMessages(plan, tempo, opts = {}) {
 // Scene order: Intro, Verse (Main A), Pre-chorus (Main B), Chorus (Main C), Fill A, Fill B, Break, Ending.
 const SCENE_INTENSITY = [0.35, 0.45, 0.6, 0.9, 0.85, 0.85, 0.4, 0.7];
 const SUPER_KNOB_SCENES = [220, 320, 520, 820, 780, 780, 260, 600];     // 0–1023 per scene
+const SCENE_INTENSITY_EDM = [0.3, 0.55, 0.4, 1.0, 0.9, 0.9, 0.35, 0.4];  // build-up starts dark: sweep the Super Knob up into the drop
+const SUPER_KNOB_SCENES_EDM = [150, 420, 200, 980, 900, 900, 180, 260];
 const ARP_VEL = [85, 88, 95, 108, 110, 110, 80, 100];                    // % per scene
 const ARP_GATE = [100, 85, 95, 100, 100, 100, 105, 110];
 const REV_SEND = {drums: 18, perc: 22, bass: 4, gtr: 30, keys: 34, strings: 48, pad: 55, comp: 30, comp2: 30};
@@ -556,7 +569,7 @@ function layerMessages(plan, opts) {
   for (let c = 0; c < 8; c++) {
     if (opts.expression !== false) { C(0x02, c, 0x06, [1]); C(0x03, c, 0x0A, [0, SCENE_REV_RETURN[c]]); }  // AEG memorize, scene reverb return
     if (opts.groove !== false) C(0x02, c, 0x07, [1]);          // Arp/MS FX memorize (per-scene arp velocity / gate)
-    if (opts.superKnob !== false) { C(0x02, c, 0x04, [1]); C(0x03, c, 0x04, d14(SUPER_KNOB_SCENES[c])); }
+    if (opts.superKnob !== false) { C(0x02, c, 0x04, [1]); C(0x03, c, 0x04, d14((plan.edm ? SUPER_KNOB_SCENES_EDM : SUPER_KNOB_SCENES)[c])); }
     if (opts.motion !== false) { C(0x02, c, 0x03, [1]); C(0x02, c, 0x01, [[2, 3, 4, 5].includes(c) ? 1 : 0]); }
   }
   if (opts.motion !== false) C(0x00, 0x01, 0x0A, [1]);         // Motion Seq master on
@@ -564,7 +577,7 @@ function layerMessages(plan, opts) {
     const p = row.part - 1, role = row.role || "comp", melodic = ["gtr", "keys", "strings", "pad", "comp", "comp2"].includes(role);
     for (let c = 0; c < 8; c++) {
       if (opts.expression !== false) {
-        const bright = melodic ? Math.round((SCENE_INTENSITY[c] - 0.65) * 36) : 0;
+        const bright = melodic ? Math.round(((plan.edm ? SCENE_INTENSITY_EDM : SCENE_INTENSITY)[c] - 0.65) * 36) : 0;
         P(p, 0x03, c, 0x0C, [0, 64 + bright]);                                    // Filter Cutoff offset
         const slow = (role === "pad" || role === "strings") && [0, 6].includes(c) ? 18 : 0;
         P(p, 0x03, c, 0x12, [0, 64 + slow]);                                      // AEG Attack offset
@@ -596,7 +609,7 @@ function layerMessages(plan, opts) {
   if (opts.superKnob !== false) {
     C(0x00, 0x01, 0x0B, [1]);                                                     // Common knob 1 follows the Super Knob
     [..."Intensity".padEnd(16, " ")].forEach((ch, i) => C(0x04, 0x00, i, [ch.charCodeAt(0)]));   // knob 1 name
-    C(0x00, 0x0D, 0x00, d14(SUPER_KNOB_SCENES[0]));                               // Super Knob value
+    C(0x00, 0x0D, 0x00, d14((plan.edm ? SUPER_KNOB_SCENES_EDM : SUPER_KNOB_SCENES)[0]));   // Super Knob value
   }
   if (lead != null) {
     for (let c = 0; c < 8; c++) {
