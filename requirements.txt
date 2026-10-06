@@ -7,3 +7,4 @@ audio-separator[cpu]>=0.30
 librosa>=0.10
 audioread
 numpy
+faster-whisper>=1.0

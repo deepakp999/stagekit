@@ -186,15 +186,14 @@ function chordsBetween(list, t0, t1, n) {
 // ---------------- stem mixer ----------------
 
 class Mixer {
+  // Streams each stem with an <audio> element (no full decode, so tablets don't run out of memory)
+  // and keeps them in sync against the first track.
   constructor(sid, stems, el) {
     this.sid = sid; this.el = el;
-    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-    this.master = this.ctx.createGain(); this.master.connect(this.ctx.destination);
     // Instrumental duplicates drums+bass+other, and original is the full mix: both start muted.
-    this.tracks = [...stems, "original"].map(name => ({name, buf: null, gain: null, src: null, vol: 1,
+    this.tracks = [...stems, "original"].map(name => ({name, a: null, vol: 1,
       mute: name === "instrumental" || (name === "original" && stems.length > 0), solo: false}));
-    this.onTick = null;
-    this.playing = false; this.offset = 0; this.startAt = 0; this.duration = 0;
+    this.onTick = null; this.playing = false; this.duration = 0;
     this.render(); this.load();
   }
   render() {
@@ -209,8 +208,8 @@ class Mixer {
           <span class="n">${STEM_LABEL[t.name]}</span>
           <button class="tog m ${t.mute ? "on" : ""}" data-i="${i}" data-k="mute" aria-label="Mute ${t.name}">M</button>
           <button class="tog s" data-i="${i}" data-k="solo" aria-label="Solo ${t.name}">S</button>
-          <input type="range" min="0" max="1.5" step="0.01" value="1" data-i="${i}" aria-label="${t.name} volume">
-          ${t.name === "original" && this.tracks.length === 1 ? "<span></span>" : `<a href="api/songs/${this.sid}/stem/${t.name}.wav" download>WAV</a>`}
+          <input type="range" min="0" max="1" step="0.01" value="1" data-i="${i}" aria-label="${t.name} volume">
+          ${t.name === "original" && this.tracks.length === 1 ? "<span></span>" : `<span class="dl"><a href="api/songs/${this.sid}/stem/${t.name}.mp3" download title="MP3, ~1.4 MB per minute">MP3</a><a href="api/songs/${this.sid}/stem/${t.name}.wav" download title="WAV, full quality, ~10 MB per minute">WAV</a></span>`}
         </div>`).join("")}`;
     $$(".tog", this.el).forEach(b => b.onclick = () => {
       const t = this.tracks[b.dataset.i]; t[b.dataset.k] = !t[b.dataset.k];
@@ -222,17 +221,24 @@ class Mixer {
     seek.oninput = () => { this.seeking = true; $("#mxtime", this.el).textContent = `${fmtTime(seek.value / 1000 * this.duration)} / ${fmtTime(this.duration)}`; };
     seek.onchange = () => { this.seeking = false; this.seek(seek.value / 1000 * this.duration); };
   }
-  async load() {
-    let done = 0;
-    await Promise.all(this.tracks.map(async t => {
-      const r = await fetch(`api/songs/${this.sid}/preview/${t.name}.mp3`);
-      if (!r.ok) throw new Error(`Could not load ${t.name}`);
-      t.buf = await this.ctx.decodeAudioData(await r.arrayBuffer());
-      t.gain = this.ctx.createGain(); t.gain.connect(this.master);
-      done++; if (!this.dead) $("#mxtime", this.el).textContent = `Loading ${done}/${this.tracks.length}`;
-    })).catch(e => { if (!this.dead) $("#mxtime", this.el).textContent = e.message; throw e; });
+  msg(text) { if (!this.dead) $("#mxtime", this.el).textContent = text; }
+  load() {
+    let ready = 0;
+    for (const t of this.tracks) {
+      const a = new Audio(); t.a = a;
+      a.preload = "auto";
+      a.addEventListener("loadedmetadata", () => {
+        ready++; this.msg(`Loading ${ready}/${this.tracks.length}`);
+        if (ready === this.tracks.length) this.ready();
+      }, {once: true});
+      a.addEventListener("error", () => this.msg(`Could not load ${STEM_LABEL[t.name] || t.name} (${a.error?.code || "?"}) — reload the page`));
+      a.addEventListener("ended", () => { if (t === this.tracks[0]) { this.pause(); this.seek(0); } });
+      a.src = `api/songs/${this.sid}/preview/${t.name}.mp3`;
+    }
+  }
+  ready() {
     if (this.dead) return;
-    this.duration = Math.max(...this.tracks.map(t => t.buf.duration));
+    this.duration = Math.max(...this.tracks.map(t => t.a.duration || 0));
     this.applyGains();
     $("#mxplay", this.el).disabled = false; $("#mxseek", this.el).disabled = false;
     this.tick();
@@ -240,30 +246,31 @@ class Mixer {
   applyGains() {
     const anySolo = this.tracks.some(t => t.solo);
     for (const t of this.tracks) {
-      if (!t.gain) continue;
+      if (!t.a) continue;
       const on = anySolo ? t.solo && !t.mute : !t.mute;
-      t.gain.gain.setTargetAtTime(on ? t.vol : 0, this.ctx.currentTime, 0.015);
+      t.a.muted = !on; t.a.volume = Math.max(0, Math.min(1, t.vol));
     }
   }
-  pos() { return this.playing ? Math.min(this.duration, this.ctx.currentTime - this.startAt) : this.offset; }
-  play() {
-    this.ctx.resume();
-    if (this.offset >= this.duration - 0.05) this.offset = 0;
-    const when = this.ctx.currentTime + 0.05;
-    for (const t of this.tracks) {
-      t.src = this.ctx.createBufferSource(); t.src.buffer = t.buf; t.src.connect(t.gain);
-      t.src.start(when, this.offset);
-    }
-    this.startAt = when - this.offset; this.playing = true;
-    $("#mxplay", this.el).textContent = "❚❚";
+  pos() { return this.tracks[0]?.a?.currentTime || 0; }
+  async play() {
+    const p = this.pos();
+    for (const t of this.tracks) if (Math.abs(t.a.currentTime - p) > 0.03) t.a.currentTime = p;
+    this.playing = true; $("#mxplay", this.el).textContent = "❚❚";
+    try { await Promise.all(this.tracks.map(t => t.a.play())); }
+    catch (e) { this.pause(); this.msg(`Playback blocked: ${e.message}`); }
   }
-  stopSources() { for (const t of this.tracks) { try { t.src?.stop(); } catch {} t.src = null; } }
-  pause() { this.offset = this.pos(); this.stopSources(); this.playing = false; $("#mxplay", this.el).textContent = "▶"; }
-  seek(s) { const was = this.playing; if (was) this.pause(); this.offset = s; if (was) this.play(); this.tick(true); }
+  pause() {
+    for (const t of this.tracks) t.a?.pause();
+    this.playing = false; $("#mxplay", this.el).textContent = "▶";
+  }
+  seek(s) { for (const t of this.tracks) if (t.a) t.a.currentTime = s; this.tick(true); }
   tick(once) {
     if (this.dead) return;
     const p = this.pos();
-    if (this.playing && p >= this.duration - 0.02) this.pause(), this.offset = 0;
+    // Keep stems locked to the first track; nudge any that drift by more than ~60 ms.
+    if (this.playing && !once) for (const t of this.tracks.slice(1)) {
+      if (!t.a.paused && Math.abs(t.a.currentTime - p) > 0.06) t.a.currentTime = p;
+    }
     this.onTick?.(p);
     if (!this.seeking) {
       $("#mxseek", this.el).value = this.duration ? Math.round(p / this.duration * 1000) : 0;
@@ -271,7 +278,7 @@ class Mixer {
     }
     if (!once) requestAnimationFrame(() => this.tick());
   }
-  destroy() { this.dead = true; this.stopSources(); this.ctx.close(); }
+  destroy() { this.dead = true; for (const t of this.tracks) if (t.a) { t.a.pause(); t.a.removeAttribute("src"); t.a.load(); } }
 }
 
 // ---------------- MODX sound finder ----------------
@@ -581,6 +588,175 @@ async function openFinder({meter = "4/4", bpm = null, onUse, onArp}) {
   dlg.showModal(); await loadFeel();
 }
 
+// ---------------- lyrics with chords over the words ----------------
+
+// Which chord falls on which word: by Whisper word timings when we have them, otherwise spread
+// across the line by time. Chords after the line has been sung go on an instrumental row.
+function layoutLyrics(lines, chords, tp, roman) {
+  const rows = [];
+  const timed = lines.filter(l => l.t != null);
+  const chordName = c => transposeChord(c.c, tp);
+  const first = timed[0]?.t ?? Infinity;
+  const intro = chords.filter(c => c.t + (c.d || 0) > 0 && c.t < first - 0.3);
+  if (intro.length && timed.length) rows.push({kind: "inst", t: intro[0].t, chords: intro.map(chordName)});
+  timed.forEach((l, i) => {
+    const next = timed[i + 1]?.t ?? (l.t + 10);
+    const text = (roman && l.roman) || l.text || "";
+    const words = text.split(/\s+/).filter(Boolean);
+    const sung = Math.min(next - l.t, Math.max(2.5, words.length * 0.75 + 1));
+    const slots = words.map(() => []);
+    const after = [];
+    // The chord already sounding when the line starts goes on its first word.
+    const active = chords.filter(c => c.t <= l.t + 0.15 && c.t + (c.d || 0) > l.t + 0.15).pop();
+    const inLine = chords.filter(c => c.t > l.t + 0.15 && c.t < next - 0.15);
+    if (active && words.length) slots[0].push(chordName(active));
+    for (const c of inLine) {
+      if (c.t > l.t + sung || !words.length) { after.push(chordName(c)); continue; }
+      let k;
+      if (l.words?.length === words.length && !roman) {
+        k = 0; l.words.forEach((w, j) => { if (w.t <= c.t + 0.1) k = j; });
+      } else {
+        k = Math.min(words.length - 1, Math.floor((c.t - l.t) / sung * words.length));
+      }
+      if (slots[k].at(-1) !== chordName(c)) slots[k].push(chordName(c));
+    }
+    rows.push({kind: "line", t: l.t, idx: lines.indexOf(l), words: words.map((w, j) => ({w, c: slots[j].join(" ")}))});
+    if (after.length) rows.push({kind: "inst", t: l.t + sung, chords: after});
+  });
+  return rows;
+}
+
+function lyricsPanel(sid, el, getMixer, getTp, canTranscribe) {
+  let data = {lines: []}, chords = [], roman = false, tapping = -1, poll = null, dead = false, cur = -1;
+  try { roman = localStorage.getItem("sk_roman") === "1"; } catch {}
+  api(`songs/${sid}/chords`).then(c => { chords = c; draw(); }).catch(() => {});
+
+  const load = async () => {
+    try { data = await api(`songs/${sid}/lyrics`); } catch (e) { data = {lines: [], job: {status: "error", message: e.message}}; }
+    draw();
+    clearTimeout(poll);
+    if (data.job?.status === "running" && !dead) poll = setTimeout(load, 3000);
+  };
+
+  const untimed = () => data.lines.length && data.lines.some(l => l.t == null);
+
+  function draw() {
+    if (dead) return;
+    const tp = getTp(), job = data.job, has = data.lines.length > 0;
+    const src = {lrclib: `LRCLIB${data.match ? ` · ${data.match}` : ""}`, whisper: `transcribed${data.language ? ` (${data.language})` : ""}`, pasted: "pasted"}[data.source] || "";
+    el.innerHTML = `
+      <div class="row"><b class="grow">Lyrics + chords ${src ? `<span class="muted small">· ${esc(src)}</span>` : ""}</b>
+        ${data.malayalam ? `<button class="btn sm" id="lyscript" title="Malayalam script / Manglish">${roman ? "മ" : "Aa"}</button>` : ""}
+        ${has ? `<button class="btn sm" id="lymenu" aria-label="Lyrics options">⋯</button>` : ""}</div>
+      ${job?.status === "running" ? `<div class="small" style="margin:8px 0"><span class="spin"></span> ${esc(job.message)}</div>` : ""}
+      ${job?.status === "error" ? `<div class="small" style="margin:8px 0;color:var(--danger)">${esc(job.message)}</div>` : ""}
+      ${!has || el.dataset.menu ? `
+        <div class="lyfind">
+          <div class="row"><input id="lyq" type="text" value="${esc(data.query || data.suggested_query || "")}" placeholder="Song name + film" aria-label="Search lyrics">
+            <button class="btn primary sm" id="lylrc">Find lyrics</button></div>
+          <div class="row" style="margin-top:6px">
+            ${canTranscribe ? `<select id="lylang" aria-label="Language"><option value="">Auto language</option><option value="ml">Malayalam</option><option value="hi">Hindi</option><option value="ta">Tamil</option><option value="te">Telugu</option><option value="kn">Kannada</option><option value="en">English</option></select>
+            <button class="btn sm" id="lywh">Transcribe vocals</button>` : ""}
+            <button class="btn sm" id="lypaste">Paste lyrics</button>
+            ${has ? `<button class="btn sm" id="lyretime">Re-time by tapping</button><button class="btn sm danger" id="lydel">Remove</button>` : ""}</div>
+          <div class="small muted" style="margin-top:6px">Find = synced lyrics from LRCLIB (free). Transcribe = speech-to-text on the vocal stem, a few minutes, rough for Malayalam. Paste = your own; then tap along once to time the lines.</div>
+        </div>` : ""}
+      ${has && data.lines.some(l => l.t != null) ? `<div class="row small muted" style="margin-top:8px">Timing <button class="btn sm" data-shift="-0.5">−0.5s</button><button class="btn sm" data-shift="0.5">+0.5s</button><span class="grow"></span>Tap a line to jump there</div>` : ""}
+      ${tapping >= 0 || untimed() ? `<div class="tapbar"><button class="btn primary" id="lytap">${tapping >= 0 ? `Tap: line ${tapping + 1} of ${data.lines.length}` : "▶ Start tap timing"}</button>
+        <span class="small muted">${tapping >= 0 ? "Tap (or press T) as each line starts. Esc to stop." : "Play the song and tap when each line starts."}</span></div>` : ""}
+      <div class="lyr" id="lyr">${has ? sheet(tp) : ""}</div>`;
+    bind();
+    cur = -1; follow(getMixer()?.pos() || 0);
+  }
+
+  function sheet(tp) {
+    if (untimed() || !chords.length) {
+      return data.lines.map((l, i) => `<div class="ll" data-i="${i}"><span class="lt">${esc((roman && l.roman) || l.text)}</span></div>`).join("");
+    }
+    return layoutLyrics(data.lines, chords, tp, roman).map(r => r.kind === "inst"
+      ? `<div class="li" data-t="${r.t}">${r.chords.map(esc).join("  ")}</div>`
+      : `<div class="ll" data-i="${r.idx}" data-t="${r.t}">${r.words.map(w => `<span class="lw"><b>${esc(w.c) || "&nbsp;"}</b>${esc(w.w)}</span>`).join(" ")}</div>`).join("");
+  }
+
+  function bind() {
+    const on = (id, f) => { const b = $(id, el); if (b) b.onclick = f; };
+    on("#lyscript", () => { roman = !roman; try { localStorage.setItem("sk_roman", roman ? "1" : "0"); } catch {} draw(); });
+    on("#lymenu", () => { el.dataset.menu ? delete el.dataset.menu : el.dataset.menu = "1"; draw(); });
+    on("#lylrc", () => start("lrclib", {query: $("#lyq", el).value}));
+    on("#lywh", () => start("whisper", {language: $("#lylang", el).value}));
+    on("#lypaste", pasteDialog);
+    on("#lydel", async () => { if (!confirm("Remove these lyrics?")) return; await api(`songs/${sid}/lyrics`, {method: "DELETE"}); delete el.dataset.menu; load(); });
+    on("#lyretime", () => { data.lines.forEach(l => l.t = null); tapping = -1; delete el.dataset.menu; draw(); toast("Play the song and tap as each line starts"); });
+    on("#lytap", tap);
+    $$("[data-shift]", el).forEach(b => b.onclick = () => shift(+b.dataset.shift));
+    $$(".ll[data-t], .li[data-t]", el).forEach(r => r.onclick = () => { const m = getMixer(); if (m?.duration) m.seek(+r.dataset.t); });
+  }
+
+  async function start(source, body) {
+    try { data.job = (await api(`songs/${sid}/lyrics/fetch`, {method: "POST", json: {source, ...body}})).job; delete el.dataset.menu; draw(); poll = setTimeout(load, 1500); }
+    catch (e) { toast(e.message); }
+  }
+
+  async function save(lines) {
+    try { data = await api(`songs/${sid}/lyrics`, {method: "PUT", json: {lines}}); draw(); } catch (e) { toast(e.message); }
+  }
+
+  function shift(d) {
+    data.lines.forEach(l => { if (l.t != null) l.t = Math.max(0, Math.round((l.t + d) * 100) / 100); });
+    l_words(d); draw(); clearTimeout(shift.t); shift.t = setTimeout(() => save(data.lines), 800);
+  }
+  function l_words(d) { data.lines.forEach(l => l.words?.forEach(w => w.t = Math.max(0, Math.round((w.t + d) * 100) / 100))); }
+
+  function tap() {
+    const m = getMixer();
+    if (!m?.duration) return toast("Wait for the player to load");
+    if (tapping < 0) {
+      tapping = 0; data.lines.forEach(l => { l.t = null; delete l.words; });
+      if (!m.playing) m.play();
+      return draw();
+    }
+    data.lines[tapping].t = Math.round(m.pos() * 100) / 100;
+    tapping++;
+    if (tapping >= data.lines.length) { tapping = -1; save(data.lines); toast("Lines timed — use ±0.5s if they're early or late"); return; }
+    draw();
+  }
+
+  function pasteDialog() {
+    const dlg = document.createElement("dialog"); dlg.className = "mdlg";
+    dlg.innerHTML = `<b>Paste lyrics</b>
+      <div class="small muted" style="margin:6px 0">One line per sung line. Malayalam script or Manglish both work. Lines with [mm:ss.xx] times (.lrc) are used as they are; otherwise you time them by tapping.</div>
+      <textarea id="lyt" style="min-height:240px" placeholder="Malare ninne kaanathirunnal…"></textarea>
+      <div class="row" style="margin-top:10px"><span class="grow"></span><button class="btn" id="lyc">Cancel</button><button class="btn primary" id="lys">Save</button></div>`;
+    document.body.append(dlg);
+    $("#lyc", dlg).onclick = () => dlg.close();
+    $("#lys", dlg).onclick = async () => {
+      try { data = await api(`songs/${sid}/lyrics`, {method: "PUT", json: {text: $("#lyt", dlg).value}}); dlg.close(); delete el.dataset.menu; draw();
+        if (untimed()) toast("Now play the song and tap as each line starts"); }
+      catch (e) { toast(e.message); }
+    };
+    dlg.addEventListener("close", () => dlg.remove()); dlg.showModal();
+  }
+
+  function follow(p) {
+    if (dead || untimed() || tapping >= 0) return;
+    const rows = $$(".ll[data-t]", el);
+    let k = -1; rows.forEach((r, j) => { if (+r.dataset.t <= p + 0.05) k = j; });
+    if (k === cur) return; cur = k;
+    rows.forEach((r, j) => r.classList.toggle("on", j === k));
+    const box = $("#lyr", el), row = rows[k];
+    if (row && getMixer()?.playing) box.scrollTo({top: row.offsetTop - box.offsetTop - box.clientHeight / 3, behavior: "smooth"});
+  }
+
+  const onKey = e => {
+    if (e.target.closest?.("input,textarea,select")) return;
+    if (tapping >= 0 && (e.key === "t" || e.key === "T")) { e.preventDefault(); tap(); }
+    if (tapping >= 0 && e.key === "Escape") { tapping = -1; draw(); }
+  };
+  document.addEventListener("keydown", onKey);
+  load();
+  return {follow, draw, destroy() { dead = true; clearTimeout(poll); document.removeEventListener("keydown", onKey); }};
+}
+
 // ---------------- song view ----------------
 
 async function songView(sid) {
@@ -602,7 +778,7 @@ async function songView(sid) {
       <div class="grid2" style="margin-top:14px">
         <div>
           ${s.status === "ready" ? `<div class="panel"><div class="row" style="margin-bottom:6px"><b class="grow">${s.quick ? "Player" : "Stems"}</b>
-            ${s.quick ? `<button class="btn sm" id="mkstems">Make stems</button>` : `<a class="btn sm" href="api/songs/${s.id}/stems.zip">Download all (zip)</a>`}</div><div id="mixer"></div></div>` : ""}
+            ${s.quick ? `<button class="btn sm" id="mkstems">Make stems</button>` : `<a class="btn sm" href="api/songs/${s.id}/stems.zip?format=mp3">All MP3 (zip)</a><a class="btn sm" href="api/songs/${s.id}/stems.zip">All WAV</a>`}</div><div id="mixer"></div></div>` : ""}
           ${s.has_chords ? `<div class="panel" style="margin-top:14px" id="chordp">
             <div class="row"><b class="grow">Chords <span class="muted small">· approximate</span></b>
               <span class="tp"><button class="btn sm" id="tpd" aria-label="Transpose down">−</button><span id="tpv"></span><button class="btn sm" id="tpu" aria-label="Transpose up">+</button></span></div>
@@ -610,6 +786,7 @@ async function songView(sid) {
             <div class="row" style="margin:6px 0 10px"><button class="btn sm" id="mark">⏱ Mark section here</button>
               <button class="btn sm" id="fill">Fill section chords</button><span class="small muted grow">Mark while playing, then fill.</span></div>
             <div class="chart" id="chart"></div></div>` : ""}
+          <div class="panel" style="margin-top:14px" id="lyrp"></div>
           ${s.youtube_id ? `<h2>YouTube</h2><div class="yt"><iframe src="https://www.youtube-nocookie.com/embed/${esc(s.youtube_id)}" title="YouTube" allow="encrypted-media; picture-in-picture; fullscreen" loading="lazy"></iframe></div>` : ""}
         </div>
         <div class="panel">
@@ -765,7 +942,12 @@ async function songView(sid) {
         drawSecs(); toast("Section chords filled — check them, then Save");
       };
     }
-    cleanup = () => { document.removeEventListener("keydown", onKey); mixer?.destroy(); };
+    const lyr = lyricsPanel(sid, $("#lyrp"), () => mixer, () => transpose, s.status === "ready");
+    if (mixer) mixer.onTick = p => { if (s.has_chords) follow(p); lyr.follow(p); };
+    const drawChart0 = drawChart;
+    if (s.has_chords) { $("#tpd").onclick = () => { transpose = Math.max(-11, transpose - 1); drawChart0(); lyr.draw(); };
+      $("#tpu").onclick = () => { transpose = Math.min(11, transpose + 1); drawChart0(); lyr.draw(); }; }
+    cleanup = () => { document.removeEventListener("keydown", onKey); mixer?.destroy(); lyr.destroy(); };
   };
 
   // While processing, refresh only the status (the card form keeps its edits).

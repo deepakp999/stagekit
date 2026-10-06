@@ -164,3 +164,19 @@ dialog.finder{overflow:auto}
 dialog.finder .chk input[type=number]{display:inline-block;width:64px;padding:4px 6px}
 .acols>*,.fcols>*{min-width:0}
 .frow .grow{min-width:0;overflow-wrap:anywhere}
+.stem .dl{display:flex;gap:8px}
+/* Lyrics with chords over the words */
+.lyr{max-height:60vh;overflow:auto;margin-top:10px;padding-right:4px;line-height:1.25}
+.lyr .ll{padding:6px 8px;border-radius:8px;cursor:pointer;font-size:19px}
+.lyr .ll.on{background:var(--panel2);box-shadow:inset 3px 0 0 var(--accent2)}
+.lyr .lw{display:inline-flex;flex-direction:column;vertical-align:bottom;margin-right:.32em}
+.lyr .lw b{font-size:15px;color:var(--accent2);min-height:1.2em;white-space:pre;font-weight:700}
+.lyr .ll.on .lw b{color:var(--accent2)}
+.lyr .li{padding:4px 8px;color:var(--accent2);font-weight:700;font-size:15px;white-space:pre-wrap;cursor:pointer;opacity:.85}
+.lyr .li::before{content:"♪ ";color:var(--muted);font-weight:400}
+.lyfind{margin-top:8px}.lyfind input{flex:1;min-width:0}.lyfind .row{flex-wrap:wrap;gap:6px}
+.tapbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+.tapbar .btn{font-size:18px;padding:12px 18px}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid var(--muted);border-top-color:transparent;border-radius:50%;animation:spin 1s linear infinite;vertical-align:-1px}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media(max-width:600px){.lyr .ll{font-size:17px}.stem{grid-template-columns:80px auto auto 1fr auto}}

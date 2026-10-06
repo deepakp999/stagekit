@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import auth as auth_mod
-from . import autobuild, db, modx, worker
+from . import autobuild, db, lyrics, modx, worker
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "web")
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
@@ -26,6 +26,7 @@ app = FastAPI(title="StageKit")
 def _startup():
     db.init()
     auth_mod.init()
+    lyrics.reset_stale_jobs()
     worker.start()
 
 
@@ -79,6 +80,7 @@ def _public(song):
     song["stems"] = [s for s in worker.STEMS if os.path.exists(os.path.join(d, "preview", f"{s}.mp3"))]
     song["quick"] = worker.is_quick(song["id"])
     song["has_chords"] = os.path.exists(os.path.join(d, "chords.json"))
+    song["has_lyrics"] = os.path.exists(os.path.join(d, "lyrics.json"))
     return song
 
 
@@ -231,6 +233,77 @@ def chords(sid: str):
         return json.load(f)
 
 
+class LyricsFetch(BaseModel):
+    source: str = "lrclib"   # lrclib | whisper
+    query: str = ""
+    language: str = ""       # whisper only: "" = auto, or ml / hi / ta / en …
+
+
+class LyricsBody(BaseModel):
+    text: Optional[str] = None    # pasted lyrics: plain lines or LRC
+    lines: Optional[list] = None  # edited/tap-timed lines [{t, text}]
+
+
+def _song_or_404(sid):
+    s = db.get_song(sid)
+    if not s:
+        raise HTTPException(404, "Song not found")
+    return s
+
+
+@app.get("/api/songs/{sid}/lyrics", dependencies=[Depends(auth)])
+def get_lyrics(sid: str):
+    s = _song_or_404(sid)
+    data = lyrics.load(sid) or {"lines": []}
+    if any(lyrics.has_malayalam(x.get("text")) for x in data["lines"]):
+        for x in data["lines"]:
+            x["roman"] = lyrics.manglish(x.get("text", ""))
+        data["malayalam"] = True
+    data["job"] = lyrics.job(sid)
+    data["suggested_query"] = lyrics.clean_title(s["title"])
+    return data
+
+
+@app.post("/api/songs/{sid}/lyrics/fetch", dependencies=[Depends(auth)])
+def fetch_lyrics(sid: str, body: LyricsFetch):
+    s = _song_or_404(sid)
+    if body.source not in ("lrclib", "whisper"):
+        raise HTTPException(400, "source must be lrclib or whisper")
+    if body.source == "whisper" and busy(s["status"]):
+        raise HTTPException(409, "Wait until the song has finished processing")
+    if not lyrics.start(sid, body.source, body.query, body.language):
+        raise HTTPException(409, "Already fetching lyrics for this song")
+    return {"ok": True, "job": lyrics.job(sid)}
+
+
+@app.put("/api/songs/{sid}/lyrics", dependencies=[Depends(auth)])
+def put_lyrics(sid: str, body: LyricsBody):
+    _song_or_404(sid)
+    if body.lines is not None:
+        lines = [{"t": (round(float(x["t"]), 2) if x.get("t") is not None else None), "text": str(x.get("text", ""))[:300],
+                  **({"words": x["words"]} if isinstance(x.get("words"), list) else {})}
+                 for x in body.lines[:500] if isinstance(x, dict)]
+        old = lyrics.load(sid) or {}
+        lyrics.save(sid, {**{k: v for k, v in old.items() if k != "lines"}, "lines": lines})
+    elif body.text is not None:
+        lines = lyrics.parse_text(body.text)
+        if not lines:
+            raise HTTPException(400, "No lyrics found in the text")
+        lyrics.save(sid, {"source": "pasted", "lines": lines})
+    else:
+        raise HTTPException(400, "Send text or lines")
+    return get_lyrics(sid)
+
+
+@app.delete("/api/songs/{sid}/lyrics", dependencies=[Depends(auth)])
+def delete_lyrics(sid: str):
+    _song_or_404(sid)
+    for p in (lyrics.path(sid), lyrics.job_path(sid)):
+        if os.path.exists(p):
+            os.remove(p)
+    return {"ok": True}
+
+
 def busy(status):
     return status in ("queued", "downloading", "separating", "analysing")
 
@@ -277,15 +350,26 @@ def stem_wav(sid: str, name: str):
     return FileResponse(p, media_type="audio/wav", filename=_fname(sid, name, "wav"))
 
 
+@app.get("/api/songs/{sid}/stem/{name}.mp3", dependencies=[Depends(auth)])
+def stem_mp3(sid: str, name: str):
+    """Same 192 kbps file the player streams (~1.4 MB per minute), as a download."""
+    p = os.path.join(db.song_dir(sid), "preview", f"{_safe_stem(name)}.mp3")
+    if not os.path.exists(p):
+        raise HTTPException(404, "Not ready")
+    return FileResponse(p, media_type="audio/mpeg", filename=_fname(sid, name, "mp3"))
+
+
 @app.get("/api/songs/{sid}/stems.zip", dependencies=[Depends(auth)])
-def stems_zip(sid: str):
-    d = os.path.join(db.song_dir(sid), "stems")
+def stems_zip(sid: str, format: str = "wav"):
+    fmt = "mp3" if format == "mp3" else "wav"
+    d = os.path.join(db.song_dir(sid), "stems" if fmt == "wav" else "preview")
     if not os.path.isdir(d):
         raise HTTPException(404, "Not ready")
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
         for f in sorted(os.listdir(d)):
-            z.write(os.path.join(d, f), _fname(sid, f[:-4], "wav"))
+            if f.endswith("." + fmt) and f[:-4] in worker.STEMS:
+                z.write(os.path.join(d, f), _fname(sid, f[:-4], fmt))
     buf.seek(0)
     return StreamingResponse(buf, media_type="application/zip",
                              headers={"Content-Disposition": f'attachment; filename="{_fname(sid, "stems", "zip")}"'})
