@@ -186,6 +186,7 @@ function chordsBetween(list, t0, t1, n) {
 
 // ---------------- stem mixer ----------------
 
+const IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 class Mixer {
   // Streams each stem with an <audio> element (no full decode, so tablets don't run out of memory)
   // and keeps them in sync against the first track.
@@ -307,7 +308,8 @@ class Mixer {
   graph() {
     if (this.ctx) return true;
     try {
-      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const AC = window.AudioContext || window.webkitAudioContext;
+      this.ctx = new AC({ latencyHint: "playback" });
       for (const t of this.tracks) {
         t.node = this.ctx.createMediaElementSource(t.a);
         t.gain = this.ctx.createGain(); t.node.connect(t.gain).connect(this.ctx.destination);
@@ -325,7 +327,7 @@ class Mixer {
       if (t.gain) t.gain.gain.setTargetAtTime(g, this.ctx.currentTime, 0.02);
       else { t.a.muted = !on; t.a.volume = Math.min(1, g); }
     }
-    if (this.playing) this.resync(true);
+    if (this.playing && !IOS) this.resync(true);
   }
   pos() { return this.tracks[0]?.a?.currentTime || 0; }
   async play() {
@@ -340,15 +342,18 @@ class Mixer {
     for (const t of this.tracks) t.a?.pause();
     this.playing = false; $("#mxplay", this.el).textContent = "▶";
   }
-  seek(s) { for (const t of this.tracks) if (t.a) { t.a.currentTime = s; t.a.playbackRate = 1; } this.tick(true); }
+  seek(s) { for (const t of this.tracks) if (t.a) { t.a.currentTime = s; if (!IOS) t.a.playbackRate = 1; } this.tick(true); }
   // Keep every stem locked to the first one: small drift is pulled in by nudging the playback rate
   // (inaudible), bigger drift (or hard = after a change) by a seek.
+  // iPhone/iPad Safari reports currentTime coarsely and glitches on every rate change or seek, so
+  // there the stems are left alone and only re-seeked if they really drift apart (> 0.3 s).
   resync(hard) {
     const ref = this.tracks[0]?.a; if (!ref) return;
     const p = ref.currentTime;
     for (const t of this.tracks.slice(1)) {
       if (t.a.paused) continue;
       const d = t.a.currentTime - p;
+      if (IOS) { if (Math.abs(d) > 0.3) t.a.currentTime = p; continue; }
       if (Math.abs(d) > (hard ? 0.03 : 0.15)) { t.a.currentTime = p + 0.01; t.a.playbackRate = 1; }
       else if (Math.abs(d) > 0.012) t.a.playbackRate = d > 0 ? 0.97 : 1.03;
       else if (t.a.playbackRate !== 1) t.a.playbackRate = 1;
