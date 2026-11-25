@@ -158,7 +158,17 @@ async function libraryView() {
           ${busy(s.status) ? `<div class="small muted" style="margin-top:4px">${esc(s.stage)}</div><div class="bar"><i style="width:${Math.round(s.progress * 100)}%"></i></div>` : ""}
           ${s.status === "error" ? `<div class="small" style="color:var(--danger);margin-top:4px">${esc(s.error)}</div>` : ""}
         </div>
+        ${["downloading", "separating", "analysing"].includes(s.status) ? "" :
+          `<button class="btn sm danger del" data-del="${s.id}" type="button" title="Delete song" aria-label="Delete ${esc(s.title)}">🗑</button>`}
       </a>`).join("") : `<div class="empty">No songs yet. Paste a YouTube link above to start.</div>`;
+    box.querySelectorAll("[data-del]").forEach(b => b.onclick = async e => {
+      e.preventDefault(); e.stopPropagation();
+      const s = songs.find(x => x.id === b.dataset.del);
+      if (!confirm(`Delete "${s.title}" and its stems? This frees the space on the server and can't be undone.`)) return;
+      b.disabled = true;
+      try { await api(`songs/${s.id}`, {method: "DELETE"}); toast("Song deleted"); load(); }
+      catch (err) { b.disabled = false; toast(err.message, 4000); }
+    });
     clearInterval(pollTimer);
     if (songs.some(s => busy(s.status))) pollTimer = setInterval(load, 4000);
   }
