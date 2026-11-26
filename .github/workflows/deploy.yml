@@ -1,0 +1,40 @@
+# Deploys StageKit to the paperclip VM whenever main changes (e.g. after merging a pull request).
+# Needs these repository secrets (Settings → Secrets and variables → Actions):
+#   PAPERCLIP_HOST     public IP or hostname of the VM
+#   PAPERCLIP_USER     SSH user (e.g. ubuntu)
+#   PAPERCLIP_SSH_KEY  private key for a deploy key whose public half is in the VM's ~/.ssh/authorized_keys
+#   PAPERCLIP_PATH     folder of the StageKit checkout on the VM (e.g. /home/ubuntu/stagekit)
+name: Deploy to paperclip
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:        # "Run workflow" button for a manual redeploy
+
+concurrency:
+  group: deploy-paperclip
+  cancel-in-progress: false # never interrupt a build half-way
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40     # first ARM build of the image can be slow
+    steps:
+      - name: Pull and rebuild on the VM
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.PAPERCLIP_HOST }}
+          username: ${{ secrets.PAPERCLIP_USER }}
+          key: ${{ secrets.PAPERCLIP_SSH_KEY }}
+          command_timeout: 35m
+          script: |
+            set -e
+            cd "${{ secrets.PAPERCLIP_PATH }}"
+            git fetch --quiet origin main
+            git reset --hard origin/main      # tracked files only; ./data and .env are untouched
+            docker compose up -d --build
+            for i in $(seq 1 30); do
+              if curl -fs localhost:8080/api/health >/dev/null; then echo "StageKit is up"; exit 0; fi
+              sleep 2
+            done
+            echo "Health check failed"; docker compose logs --tail 50 stagekit; exit 1
