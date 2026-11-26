@@ -327,7 +327,8 @@ class Mixer {
       if (t.gain) t.gain.gain.setTargetAtTime(g, this.ctx.currentTime, 0.02);
       else { t.a.muted = !on; t.a.volume = Math.min(1, g); }
     }
-    if (this.playing && !IOS) this.resync(true);
+    // No resync here: mute/solo/volume only change gain, never timing. A hard resync on every tap
+    // re-seeked stems from Android's coarse currentTime readings and knocked them out of line.
   }
   pos() { return this.tracks[0]?.a?.currentTime || 0; }
   async play() {
@@ -342,7 +343,7 @@ class Mixer {
     for (const t of this.tracks) t.a?.pause();
     this.playing = false; $("#mxplay", this.el).textContent = "▶";
   }
-  seek(s) { for (const t of this.tracks) if (t.a) { t.a.currentTime = s; if (!IOS) t.a.playbackRate = 1; } this.tick(true); }
+  seek(s) { for (const t of this.tracks) if (t.a) { t.a.currentTime = s; t.drift = 0; if (!IOS) t.a.playbackRate = 1; } this.tick(true); }
   // Keep every stem locked to the first one: small drift is pulled in by nudging the playback rate
   // (inaudible), bigger drift (or hard = after a change) by a seek.
   // iPhone/iPad Safari reports currentTime coarsely and glitches on every rate change or seek, so
@@ -354,9 +355,12 @@ class Mixer {
       if (t.a.paused) continue;
       const d = t.a.currentTime - p;
       if (IOS) { if (Math.abs(d) > 0.3) t.a.currentTime = p; continue; }
-      if (Math.abs(d) > (hard ? 0.03 : 0.15)) { t.a.currentTime = p + 0.01; t.a.playbackRate = 1; }
-      else if (Math.abs(d) > 0.012) t.a.playbackRate = d > 0 ? 0.97 : 1.03;
-      else if (t.a.playbackRate !== 1) t.a.playbackRate = 1;
+      // Average the drift over ~0.5 s: a single currentTime reading on Android can be 20–40 ms off.
+      t.drift = (t.drift ?? d) * 0.9 + d * 0.1;
+      const avg = hard ? d : t.drift;
+      if (Math.abs(avg) > (hard ? 0.05 : 0.15)) { t.a.currentTime = p + 0.01; t.a.playbackRate = 1; t.drift = 0; }
+      else if (Math.abs(avg) > 0.02) t.a.playbackRate = avg > 0 ? 0.99 : 1.01;   // gentle, inaudible nudge
+      else if (Math.abs(avg) < 0.008 && t.a.playbackRate !== 1) t.a.playbackRate = 1;
     }
   }
   tick(once) {
